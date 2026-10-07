@@ -6,6 +6,10 @@ SessionDB indexes local session records in SQLite and retains exact content in c
 
 This is the first standalone release candidate, `0.1.0rc1`. macOS is the tested platform. Continuous watching uses native macOS filesystem events. Linux and Windows compatibility have not been validated.
 
+## Folder guide
+
+`src/` contains the library and command-line tools; `tests/` contains synthetic tests; `examples/` contains sample inputs; `scripts/` contains rebuild-readiness tooling; `docs/release/` contains release scope and verification records. Build metadata, the README, and the MIT license stay at the root.
+
 ## Install from this checkout
 
 Python 3.9 with SQLite FTS5 support is the tested runtime; the package requires Python 3.9 or newer. Install into a dedicated virtual environment to keep it separate from other SessionDB installations:
@@ -69,7 +73,7 @@ The generator is `scripts/rebuild_readiness.py` and runs from a clean, committed
 PYTHONPATH=src .venv/bin/python -m unittest discover -s tests
 ```
 
-The tests use synthetic fixtures. For checking coexistence with another installation, run them in a separate test account or with an isolated process home and database. The retained test methods and omitted private-service tests are listed in `release/extraction-manifest.json`.
+The tests use synthetic fixtures. For checking coexistence with another installation, run them in a separate test account or with an isolated process home and database. The retained test methods and omitted private-service tests are listed in `docs/release/extraction-manifest.json`.
 
 ## First-release boundaries
 

@@ -1,3 +1,29 @@
 [build-system]
-requires = ["setuptools>=58", "wheel"]
+requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "local-sessiondb-public"
+version = "0.1.0rc1"
+description = "Local search and verifiable retrieval across Claude and Codex coding sessions"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+]
+dependencies = ["zstandard==0.25.0", "tiktoken==0.11.0", "watchdog==6.0.0"]
+
+[project.scripts]
+sessiondb = "sessiondb:main"
+sessiondb-admin = "full_corpus:main"
+sessiondb-export = "snapshot_export:main"
+sessiondb-freshness = "freshness_service:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = ["sessiondb", "full_corpus", "snapshot_export", "freshness_service"]
+license-files = ["LICENSE"]

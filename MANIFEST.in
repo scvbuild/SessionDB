@@ -2,4 +2,4 @@ include LICENSE README.md
 recursive-include examples *.jsonl
 recursive-include scripts *.py
 recursive-include tests *.py
-recursive-include release *.md *.json
+recursive-include docs/release *.md *.json

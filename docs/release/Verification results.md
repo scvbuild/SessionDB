@@ -34,3 +34,11 @@ A read-only Claude Opus consultation ran three plan-review rounds. Its material 
 ## Remaining limits
 
 No production data or original repository history was copied. Privacy checks were targeted source/package checks, not a guarantee that best-effort redaction catches all sensitive content. Linux, Windows, production-corpus latency, public adoption, GitHub publication, and OpenAI program acceptance remain unverified.
+
+## Folder reorganization verification
+
+The release records now live under `docs/release/`. Package configuration is consolidated in `pyproject.toml`; `MANIFEST.in` includes the new documentation location. The public root contains four visible files.
+
+The reorganized candidate built both a source archive and a wheel using Python 3.9 and the minimum declared setuptools version, 61.0.0. The before/after wheel lists contain the same ten files; module and license bytes, parsed command entry points, dependency versions, Python requirement, and license metadata are preserved. The source archive keeps the release records under their new paths. Setuptools creates a minimal `setup.cfg` inside the source archive; the checkout does not require that file.
+
+All 229 synthetic tests passed in 17.637 seconds, including the installed-command flows and native watcher checks. `pip check` found no broken requirements. Retrieval and storage source files and retained tests were not changed by this reorganization.
