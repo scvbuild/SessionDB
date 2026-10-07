@@ -2,7 +2,7 @@
 
 **Let your AI agents remember what you already did, across Claude and Codex.**
 
-SessionDB turns your local Claude Code and Codex transcripts into one searchable history. An agent starting a new session can ask "what did we decide about X last week?" and get the relevant messages back in seconds, with a reference to exactly where each one came from.
+SessionDB turns your local Claude Code and Codex transcripts into one searchable history. An agent starting a new session can ask "what did we decide about X last week?" and get the relevant messages back, with a reference to exactly where each one came from. In a test on 28 real lookups, agents using SessionDB answered in about half the time of agents searching raw transcripts.
 
 It runs entirely on your Mac, needs no server or account, and never moves or deletes your transcripts.
 
@@ -34,9 +34,9 @@ flowchart LR
 | What it does | Why it matters |
 | --- | --- |
 | **One store for both providers** | Search Claude and Codex together, with the same filters for provider, project, session, date, role and tool |
-| **Deduplication** | Content repeated across messages and sessions (instructions, tool output, attachments) is stored once and compressed, so it doesn't flood results or disk |
+| **Deduplication** | Content repeated across messages and sessions (instructions, tool output, attachments) is stored once and compressed |
 | **Ranked search** | Phrases, `AND` / `OR` / `NOT`, nearness, and accent-aware English and Vietnamese matching; exact phrases and close matches rank first |
-| **Passages first, details on demand** | The agent reads up to ten short passages, then opens only the messages it needs, so it uses less context |
+| **Passages first, details on demand** | The agent reads up to ten short passages, then opens only the messages it needs |
 | **Traceable evidence** | Every result points to its session, source file and line |
 | **Honest coverage** | Each answer states whether every relevant file was searched; if not, it names the exact file and where to resume |
 | **Stays current** | A watcher adds new transcript lines as they're written; even a session still in progress can be searched |
@@ -45,6 +45,47 @@ flowchart LR
 ---
 
 ## Performance
+
+### SessionDB vs raw transcripts
+
+**Agents using SessionDB answered about twice as fast, but not more accurately or more cheaply.** Same agent (Claude Opus 5.5), same 28 real history questions, one run each way:
+
+| Per lookup (median) | SessionDB | Raw transcripts |
+| --- | ---: | ---: |
+| Answer fully correct | 25 of 28 | 28 of 28 |
+| Time to answer | **91 s** | 200 s |
+| Faster of the two | **25 of 28 lookups** | 3 of 28 |
+| Time until the needed facts reached the agent | **34 s** | 85 s |
+| Tokens processed (mostly cached input) | 294 k | 237 k |
+| Model cost | $0.48 | $0.42 |
+| Tool calls | 10 | 9.5 |
+| Time per tool call | 0.58 s | 0.19 s |
+
+```mermaid
+xychart-beta
+    title "Median time to answer (seconds)"
+    x-axis ["SessionDB", "Raw transcripts"]
+    y-axis "seconds" 0 --> 220
+    bar [91, 200]
+```
+
+What this means:
+
+- **Speed:** SessionDB was faster in 25 of 28 lookups, a median of 2.2 times faster per lookup. Agents found the right session sooner, then read it.
+- **Tokens and cost:** no saving. SessionDB lookups processed about 20% more tokens and cost about 14% more, because agents read more search results and full messages.
+- **Accuracy:** the raw-transcript agent never missed. Three SessionDB answers were incomplete: once the needed message never surfaced because system-prompt and tool-output records crowded the ranked results, and twice the agent had seen the fact but left it out.
+
+<details>
+<summary>How it was measured</summary>
+
+- **Questions:** 28 real requests from the author's Claude and Codex sessions (August to October 2026) that needed an earlier session to answer. Each has one or two facts confirmed in an earlier session record and not available from repository files at the time. 17 were the first message of a session; 11 came mid-session, with the earlier conversation included.
+- **Fair setup:** each agent saw history only up to the moment of the original request, through a cut copy of the transcripts. The SessionDB agent could also read those raw files, as its guide allows. Both had the same prompt frame, tools (shell, Grep, Glob, Read) and limits. Any run that touched files outside its own copy was invalid and rerun.
+- **Grading:** a separate Opus 5.5 grader judged each final answer against the expected facts without knowing which method produced it. Two questions whose expected answer turned out to be wrong were corrected after review, and both methods' answers were regraded.
+- **Limits:** one run per question per method, one model, one person's history, measured on the private build this release was extracted from. Codex agents were not tested.
+
+</details>
+
+### Search speed
 
 **This release (0.1.0rc1), measured on 2,000 invented records** on one Mac. Medians of ten runs after two warm-ups; results were identical to the private build it was extracted from.
 
@@ -66,13 +107,14 @@ flowchart LR
 | Word searches | 4.5–4.7 s for `khách hàng` (4,264) and `cleanupPeriodDays` (2,729) |
 | Very common word | 11.9 s for `error` (47,494 matches) |
 
-Your results depend on how much history you have, your hardware, and how common your search words are. Token savings compared with reading raw transcripts have not been re-measured on the current version.
+Your results depend on how much history you have, your hardware, and how common your search words are.
 
 ## Trade-offs
 
 | Trade-off | What to expect |
 | --- | --- |
-| **Agents still need good instructions** | Having the evidence in the database doesn't guarantee an agent reads it. In early tests, agents often stopped at a short passage instead of opening the full message, or passed a result alias as a session ID. The instructions in the setup guide below address both |
+| **Faster, not cheaper or more accurate** | In the benchmark above, SessionDB halved the time to an answer but used about 20% more tokens, and 3 of 28 answers were incomplete where raw search got all 28 |
+| **Agents still need good instructions** | Having the evidence in the database doesn't guarantee an agent uses it. Agents sometimes stop at a short passage instead of opening the full message, or leave out a fact they saw. The instructions in the setup guide below help |
 | **Disk space** | SessionDB keeps its own copy of your history. It was smaller than the raw transcripts on the author's data, but that is not guaranteed, and you keep the transcripts too |
 | **Setup and first sync** | History must be synced before it can be searched; a large history takes a while the first time |
 | **Some searches are slow** | Very common words can take over 10 s on a large history. Search stops at 30 s by default and says so rather than returning a partial answer |
