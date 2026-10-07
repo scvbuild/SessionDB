@@ -1,0 +1,72 @@
+{
+  "corpus": "2000 synthetic Claude records",
+  "result_identity": "identical ordered result IDs in all six runs",
+  "execution_order": [
+    "private",
+    "public",
+    "public",
+    "private",
+    "private",
+    "public"
+  ],
+  "search_repetitions_per_query_per_run": 10,
+  "warmup_repetitions": 2,
+  "cases": [
+    {
+      "query": "\"release checklist\"",
+      "matches": 2000,
+      "private_run_medians_ms": [
+        127.488,
+        112.605,
+        112.506
+      ],
+      "public_run_medians_ms": [
+        116.958,
+        118.084,
+        136.303
+      ],
+      "private_median_ms": 112.605,
+      "public_median_ms": 118.084,
+      "delta_percent": 4.87
+    },
+    {
+      "query": "backup AND verified",
+      "matches": 2000,
+      "private_run_medians_ms": [
+        34.612,
+        34.404,
+        34.529
+      ],
+      "public_run_medians_ms": [
+        31.941,
+        33.728,
+        39.218
+      ],
+      "private_median_ms": 34.529,
+      "public_median_ms": 33.728,
+      "delta_percent": -2.32
+    },
+    {
+      "query": "\"ghi ch\u00fa\"",
+      "matches": 2000,
+      "private_run_medians_ms": [
+        143.327,
+        133.8,
+        135.27
+      ],
+      "public_run_medians_ms": [
+        138.603,
+        134.875,
+        219.536
+      ],
+      "private_median_ms": 135.27,
+      "public_median_ms": 138.603,
+      "delta_percent": 2.46
+    }
+  ],
+  "limits": "Small synthetic corpus, sequential alternating runs on one machine. No production-corpus performance claim.",
+  "private_ingest_seconds": 0.4985,
+  "public_ingest_seconds": 0.5511,
+  "private_build_seconds": 0.5638,
+  "public_build_seconds": 0.5355
+}

@@ -1,0 +1,2 @@
+{"type":"user","sessionId":"demo-claude","timestamp":"2026-10-01T09:00:00Z","message":{"role":"user","content":"Where is the release checklist?"}}
+{"type":"assistant","sessionId":"demo-claude","timestamp":"2026-10-01T09:01:00Z","message":{"role":"assistant","content":"The release checklist requires tests and documentation. Ghi chú phát hành đã sẵn sàng."}}
