@@ -72,6 +72,7 @@ What this means:
 - **Questions with their context included** (the closest to asking an agent in a session that already knows what you mean): SessionDB was faster in 35 of 40 runs, at a median 0.20× the time and 0.61× the tokens per question.
 - **Original requests with little or no context** ("that issue from before", often the first message of a session): SessionDB was faster in 26 of 28, at 0.38× the time and 0.69× the tokens. One answer picked an older, similar incident than the one meant; raw search got that one right. Real use is likely between the two sets.
 - **Raw transcripts are rarely needed.** Most extra raw reads re-checked text SessionDB had already found; one computed per-turn token statistics, which SessionDB doesn't aggregate. The one held-out case was a search that ran out of time, since fixed.
+- **Rerun on this release's code** (only the 6 questions above that missed or opened raw files, one run each, two for the held-out one): the time-out case answered correctly twice without raw files, and the wrong-incident request was answered correctly. Two of the original requests still opened raw files and two came back partial, so single runs vary; the tables above remain the measured totals.
 
 <details>
 <summary>How it was measured</summary>
