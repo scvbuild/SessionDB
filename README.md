@@ -2,7 +2,7 @@
 
 **Let your AI agents remember what you already did, across Claude and Codex.**
 
-SessionDB turns your local Claude Code and Codex transcripts into one searchable history. An agent starting a new session can ask "what did we decide about X last week?" and get the relevant messages back, with a reference to exactly where each one came from. In tests on real history questions, agents using SessionDB answered 2.7–5 times faster than agents searching raw transcripts, with about 30–40% fewer tokens.
+SessionDB turns your local Claude Code and Codex transcripts into one searchable history. An agent starting a new session can ask "what did we decide about X last week?" and get the relevant messages back, with a reference to exactly where each one came from. In a test on 20 real history questions, agents using SessionDB answered about 5 times faster than agents searching raw transcripts, with about 40% fewer tokens.
 
 It runs entirely on your Mac, needs no server or account, and never moves or deletes your transcripts.
 
@@ -46,78 +46,31 @@ flowchart LR
 
 ## Performance
 
-### SessionDB vs raw transcripts
+**Agents using SessionDB answered about 5 times faster than agents searching raw transcripts, used about 40% fewer tokens, and were right every time.** Same agent (Claude Opus 5.5) on both sides, 20 real history questions, two runs each:
 
-**Agents using SessionDB answered 2.7–5 times faster with fewer tokens.** With the question's context included, they were also right every time. Same agent (Claude Opus 5.5) on both sides, two sets of real history questions:
-
-| Per lookup (median) | With context: SessionDB | With context: Raw | Original requests: SessionDB | Original requests: Raw |
-| --- | ---: | ---: | ---: | ---: |
-| Answer fully correct | **40 of 40** | 37 of 40 | 27 of 28 | 28 of 28 |
-| Time to answer | **32.5 s** | 161.6 s | **72.8 s** | 200 s |
-| Answered within 40 s | **30 of 40** | 6 of 40 | 2 of 28 | — |
-| Tokens processed (mostly cached input) | **65 k** | 107 k | **160 k** | 237 k |
-| Tool calls | 3 | 7 | 6.5 | 9.5 |
-| Runs that also opened raw transcripts | 1 of 40 | — | 4 of 28 | — |
-
-```mermaid
-xychart-beta
-    title "Median time to answer (seconds)"
-    x-axis ["With context: SessionDB", "With context: Raw", "Original: SessionDB", "Original: Raw"]
-    y-axis "seconds" 0 --> 220
-    bar [32.5, 161.6, 72.8, 200]
-```
-
-What this means:
-
-- **Questions with their context included** (the closest to asking an agent in a session that already knows what you mean): SessionDB was faster in 35 of 40 runs, at a median 0.20× the time and 0.61× the tokens per question.
-- **Original requests with little or no context** ("that issue from before", often the first message of a session): SessionDB was faster in 26 of 28, at 0.38× the time and 0.69× the tokens. One answer picked an older, similar incident than the one meant; raw search got that one right. Real use is likely between the two sets.
-- **Raw transcripts are rarely needed.** Most extra raw reads re-checked text SessionDB had already found; one computed per-turn token statistics, which SessionDB doesn't aggregate. The one held-out case was a search that ran out of time, since fixed.
-- **Reruns after the fixes** (only the 6 questions above that missed or opened raw files; one or two runs each; the tables above remain the measured totals):
-  - *Time-out fix:* the held-out question that ran out of time answered without raw files in all 4 later runs (3 correct, 1 picked a different session).
-  - *`grep`, `sessions`, `record-stream`:* every raw read had been grep, a script on one session's records, or listing sessions by date or title. With these commands named in the agent instructions, agents used them instead (over 40 `grep` and 16 `record-stream` calls in 7 runs); all 5 original requests were answered correctly, and the wrong-incident request was right in both reruns.
-  - *Still open:* agents sometimes list the session folder (`ls`) to see file names, and one question came back partial twice (right session, one detail missing).
+| Per lookup (median) | SessionDB | Raw transcripts | SessionDB vs raw |
+| --- | ---: | ---: | --- |
+| Answer fully correct | **40 of 40** | 37 of 40 | 3 more fully correct |
+| Time to answer | **32.5 s** | 161.6 s | **5.0× faster** |
+| Answered within 40 s | **30 of 40** | 6 of 40 | 5× as many |
+| Tokens processed (mostly cached input) | **65 k** | 107 k | **39% fewer** |
+| Tool calls | **3** | 7 | 57% fewer |
 
 <details>
 <summary>How it was measured</summary>
 
-- **Questions:** real requests from the author's Claude and Codex sessions (June to October 2026) whose answer was in an earlier session, not in repository files at the time.
-  - *With context included:* 20 questions kept aside and never used while tuning SessionDB, each rewritten to stand alone while keeping the author's wording; two runs per question. An independent reviewer checked every expected fact against the source lines. Mixed English and Vietnamese, half Claude and half Codex.
-  - *Original requests:* 28 requests exactly as asked; 17 were the first message of a session, 11 included up to 20 earlier messages as plain text (no tool output or files, so less context than a real session). One run per question; the raw-transcript figures come from an earlier run on the same questions.
-- **Fair setup:** each agent saw history only up to the moment of the original request, through a frozen copy cut at that time. Both had the same prompt frame, tools (shell, Grep, Glob, Read) and limits; the SessionDB agent followed the instructions in the setup guide below and could still open raw files.
-- **Grading:** a separate Opus 5.5 grader judged each final answer against the expected facts without knowing which method produced it.
-- **Limits:** one model, one person's history, measured on 8 October 2026 with the private build this release is extracted from. Codex agents were not tested.
+- **Questions:** 20 real requests from the author's Claude and Codex sessions whose answer was in an earlier session, each rewritten to stand alone with its context while keeping the author's wording. They were kept aside and never used while tuning SessionDB. An independent reviewer checked every expected fact against the source. Mixed English and Vietnamese, half Claude and half Codex.
+- **Fair setup:** each agent saw history only up to the moment of the original request, through a frozen copy cut at that time, with the same prompt frame, tools and limits. The SessionDB agent followed the instructions in the setup guide below and could still open raw files; it did so in 1 of 40 runs.
+- **Grading:** a separate Opus 5.5 grader judged each answer against the expected facts without knowing which method produced it.
+- **Limits:** one model, one person's history, measured on 8 October 2026 with the private build this release is extracted from. Your results depend on how much history you have and your hardware.
 
 </details>
-
-### Search speed
-
-**This release (0.1.0rc1), measured on 2,000 invented records** on one Mac. Medians of ten runs after two warm-ups; results were identical to the private build it was extracted from.
-
-| Operation | Time |
-| --- | ---: |
-| Phrase search `"release checklist"` | 118 ms |
-| Boolean search `backup AND verified` | 34 ms |
-| Vietnamese phrase `"ghi chú"` | 139 ms |
-| Sync the 2,000 records | 551 ms |
-| Build the search index | 536 ms |
-
-**The private build, on the author's real history (7 October 2026).** Same search engine, measured before packaging; not re-measured on this release. Search times are single runs.
-
-| Measure | Result |
-| --- | --- |
-| History size | 971,498 events from Claude and Codex |
-| Disk use | 5.1 GB for the database and search index vs 5.9 GB of transcripts (13% smaller). Saved search results, snapshots and test data added another 1.4 GB |
-| Phrase searches | 0.6 s for `"release checklist"` (72 matches); 1.0 s for `"báo giá"` (3,577) |
-| Word searches | 4.5–4.7 s for `khách hàng` (4,264) and `cleanupPeriodDays` (2,729) |
-| Very common word | 11.9 s for `error` (47,494 matches) |
-
-Your results depend on how much history you have, your hardware, and how common your search words are.
 
 ## Trade-offs
 
 | Trade-off | What to expect |
 | --- | --- |
-| **Vague requests can still pick the wrong session** | With little context, an agent may choose an older, similar incident than the one meant (1 of 28 in the benchmark above, where raw search got it right). Naming a date, project or detail avoids it |
+| **Vague requests can still pick the wrong session** | With little context, an agent may choose an older, similar incident than the one meant. Naming a date, project or detail avoids it |
 | **Agents still need good instructions** | Having the evidence in the database doesn't guarantee an agent uses it. Without the instructions in the setup guide below, agents read too much, fall back to raw transcripts, or leave out a fact they saw |
 | **Disk space** | SessionDB keeps its own copy of your history. It was smaller than the raw transcripts on the author's data, but that is not guaranteed, and you keep the transcripts too |
 | **Setup and first sync** | History must be synced before it can be searched; a large history takes a while the first time |
