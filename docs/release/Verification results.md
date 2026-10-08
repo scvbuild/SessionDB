@@ -52,3 +52,11 @@ All 270 synthetic tests passed against a fresh install of this repository, inclu
 ## Second carry-across (8 October 2026)
 
 Private revision `28b1e96` adds the `grep` and `sessions` commands, `record-stream --output -`, and one-line follow-up hints. Carried across with the public receipt namespace kept; the extraction manifest records the new hashes and retained tests. All 276 synthetic tests passed against a fresh install (one test, which checks the private agent guide, is skipped here).
+
+## Version 1.0.0 release verification (8 October 2026)
+
+The version 1.0.0 wheel and source archive built on Python 3.9. The wheel installed into an isolated test environment and `pip check` reported no broken requirements. The suite ran 276 tests in 17.856 seconds: 275 passed and one private-agent-guide test was skipped. Installed-command flows and native macOS watcher checks were included; no production database or installation was changed.
+
+A targeted publication scan covered all 44 reachable history blobs and both distribution archives. It found no author-specific home paths, private credentials path, repair launcher, or targeted private email references. The archives contain no database, object-store, or environment files. Synthetic secret fixtures remain in the tests; this scan is not a comprehensive secret-detection guarantee. The wheel contains ten files and the source archive contains 29 files.
+
+The earlier candidate results above remain historical evidence. Linux, Windows, public adoption, and OpenAI program acceptance remain unverified.

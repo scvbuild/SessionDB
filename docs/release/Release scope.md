@@ -1,6 +1,6 @@
 # First public release scope
 
-The first release is a separate local candidate. It does not replace or modify the private installation. Publication and the OpenAI application have not been performed.
+The first public release is a standalone copy. It does not replace or modify the private installation. Publication and program applications are separate from installation.
 
 ## Source boundary
 

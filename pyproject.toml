@@ -4,13 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "local-sessiondb-public"
-version = "0.1.0rc1"
+version = "1.0.0"
 description = "Local search and verifiable retrieval across Claude and Codex coding sessions"
 readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}
 classifiers = [
-    "Development Status :: 3 - Alpha",
     "Operating System :: MacOS",
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
