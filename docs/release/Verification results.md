@@ -48,3 +48,7 @@ All 229 synthetic tests passed in 17.637 seconds, including the installed-comman
 The private source at revision `69ca922` was carried across: `sessiondb.py` (with the public receipt namespace), `full_corpus.py`, and `snapshot_export.py`, plus the watcher's handling of Codex's title index in the local-only watcher. The extraction manifest records the new source hashes and retained tests. Private test changes were applied to the retained tests; two changes touched only tests this release omits. Two private test files (`test_agent_reading.py`, `test_search_noise_and_titles.py`) were added; they use only the retained engine.
 
 All 270 synthetic tests passed against a fresh install of this repository, including the installed-command flows and native watcher checks. `pip check` found no broken requirements.
+
+## Second carry-across (8 October 2026)
+
+Private revision `28b1e96` adds the `grep` and `sessions` commands, `record-stream --output -`, and one-line follow-up hints. Carried across with the public receipt namespace kept; the extraction manifest records the new hashes and retained tests. All 276 synthetic tests passed against a fresh install (one test, which checks the private agent guide, is skipped here).

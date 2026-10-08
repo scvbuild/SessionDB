@@ -1,7 +1,7 @@
 {
-  "source_revision": "69ca922478cfe6ea882dbf5cc3ab671ebb625819",
+  "source_revision": "28b1e96abbd359ffb6fd12e2089715c0bd55294b",
   "copied": {
-    "sessiondb.py": "bc942e2ec87298e2550d7481fe2e1ddcc29b26b483e8e7063f00c9551bc496c1",
+    "sessiondb.py": "ce16f64ad8faa812a13dded736d8a94d0c88b770c3882c37bc9b1dd7f6913b66",
     "full_corpus.py": "60a06def799a46e9b83a8fabf2b41690c9e781a156819f1274820d2824d7f18c",
     "snapshot_export.py": "b6a1edf4a98b2d8a053e6f7c2f69bbdb0e6946d93f457f083447647a970fe312"
   },
@@ -147,7 +147,13 @@
       "ReviewFindingsTest.test_canonical_copies_are_loaded_only_when_a_copy_needs_checking",
       "ReviewFindingsTest.test_prefix_is_fts_verified_only_on_the_accent_keeping_index",
       "ReviewFindingsTest.test_bundle_text_page_says_when_it_is_incomplete_and_keeps_its_filters",
-      "ReviewFindingsTest.test_read_hints_are_quoted_and_keep_the_provider"
+      "ReviewFindingsTest.test_read_hints_are_quoted_and_keep_the_provider",
+      "GrepAndRedirectTest.test_fixed_string_and_regex_find_records_with_context",
+      "GrepAndRedirectTest.test_secrets_are_matched_but_never_shown",
+      "GrepAndRedirectTest.test_a_pattern_without_words_needs_a_scope",
+      "GrepAndRedirectTest.test_literal_runs_follow_regex_alternatives",
+      "SessionsListTest.test_sessions_by_time_window_and_by_title",
+      "AgentGuideCoverageTest.test_the_agent_guide_names_every_agent_command"
     ],
     "test_presentation_repairs.py": [
       "PresentationRepairsTest.test_short_claude_content_survives_metadata_and_redaction",

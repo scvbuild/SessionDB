@@ -72,7 +72,10 @@ What this means:
 - **Questions with their context included** (the closest to asking an agent in a session that already knows what you mean): SessionDB was faster in 35 of 40 runs, at a median 0.20× the time and 0.61× the tokens per question.
 - **Original requests with little or no context** ("that issue from before", often the first message of a session): SessionDB was faster in 26 of 28, at 0.38× the time and 0.69× the tokens. One answer picked an older, similar incident than the one meant; raw search got that one right. Real use is likely between the two sets.
 - **Raw transcripts are rarely needed.** Most extra raw reads re-checked text SessionDB had already found; one computed per-turn token statistics, which SessionDB doesn't aggregate. The one held-out case was a search that ran out of time, since fixed.
-- **Rerun on this release's code** (only the 6 questions above that missed or opened raw files, one run each, two for the held-out one): the time-out case answered correctly twice without raw files, and the wrong-incident request was answered correctly. Two of the original requests still opened raw files and two came back partial, so single runs vary; the tables above remain the measured totals.
+- **Reruns after the fixes** (only the 6 questions above that missed or opened raw files; one or two runs each; the tables above remain the measured totals):
+  - *Time-out fix:* the held-out question that ran out of time answered without raw files in all 4 later runs (3 correct, 1 picked a different session).
+  - *`grep`, `sessions`, `record-stream`:* every raw read had been grep, a script on one session's records, or listing sessions by date or title. With these commands named in the agent instructions, agents used them instead (over 40 `grep` and 16 `record-stream` calls in 7 runs); all 5 original requests were answered correctly, and the wrong-incident request was right in both reruns.
+  - *Still open:* agents sometimes list the session folder (`ls`) to see file names, and one question came back partial twice (right session, one detail missing).
 
 <details>
 <summary>How it was measured</summary>
@@ -178,7 +181,7 @@ Without the watcher, searches still work: newer transcript lines are reported as
 To find earlier Claude or Codex work, use SessionDB:
 `~/.local/share/sessiondb/venv/bin/sessiondb --db ~/.local/share/sessiondb/data/sessiondb.sqlite <command>`
 1. Search: `search-index --format text --text '<2-4 distinctive words>'`. If the request gives a session ID, date, or exact string, filter by it (`--session`, `--since`/`--until`, quoted text). Words combine with AND; use `a OR b` and `'"exact phrase"'`; `--role user|assistant` limits the speaker.
-2. To find where an exact string first or ever appeared, search it in quotes with `--order chronological`. Inside one session, search it (`--session <id>`) instead of reading through it.
+2. To find where an exact string first or ever appeared, search it in quotes with `--order chronological`. Inside one session, search it (`--session <id>`) instead of reading through it. For anything you would do with grep, rg, or a script on transcript files, use `grep '<regex>'` (`-F` exact text, `-i`, `-l` lists sessions with counts and first and last times, `--session`, `--since`/`--until`) or `record-stream --session <id> --output -` (the session's original records, one JSON object per line). To list sessions by date or title, use `sessions --since <date> --until <date>` or `sessions --title '<words>'`.
 3. Read when the shown evidence is not enough: run the session's ready `read … --line L --evidence` command. `--full` shows one record unabridged; `read --session <id> --tail 1` prints its title, time span, app, model and folder.
 4. When several sessions match, choose the one that fits every detail the request gives; prefer the most recent only when asked for the latest or current state.
 5. Before answering, check each requested claim against a record you read, and say plainly when one is not in the history.
@@ -243,7 +246,9 @@ Readable details show redacted content without the provider envelope; the defaul
 | `bundle-page` | Read more entries from a saved search bundle | `--bundle`, `--offset`, `--limit`, `--format text` |
 | `details` | Retrieve selected messages and context | `--snapshot-id`, `--result-id`, `--bundle`, `--readable` |
 | `query` | List filtered events with paging | `--clean`, `--page-envelope`, `--limit`, `--offset` |
-| `record-stream` | Read stored provider records | See command help |
+| `grep` | Every stored record matching a regex or exact text, with surrounding text, or the sessions that match with counts and first and last times | `-F`, `-i`, `-l`, `-C`, `-m`, `--session`, `--since`, `--until` |
+| `sessions` | Sessions active in a time window, or whose title has given words | `--since`, `--until`, `--title`, `--provider` |
+| `record-stream` | Stored provider records; `--output -` prints a session's original records one per line for scripts | `--session`, `--category`, `--output` |
 | `report` | Inspect the database | See command help |
 
 Search and query filters include `--provider`, `--project`, `--session`, `--role`, `--tool`, `--lineage`, `--since`, and `--until`; a date alone means that whole day (UTC). Relevance order is the default; chronological order is available. `--format text` groups results by session for agents to read, with a ready `read` command for each. Command help is the full reference:
@@ -289,7 +294,7 @@ SessionDB runs locally, but its stored content can include credentials, customer
 
 This is the first standalone release candidate, **`0.1.0rc1`**, under the [MIT license](LICENSE). It includes local sync, storage, search, evidence retrieval, export/backup, and a foreground macOS watcher. Automatic agent repair, external notifications, scheduled nightly audits, agent benchmarks, and the walkthrough app are not included.
 
-All 270 synthetic tests pass, including installed commands and native macOS watcher events. See the [release scope](docs/release/Release%20scope.md), [verification report](docs/release/Verification%20results.md), and [recorded measurements](docs/release/synthetic-performance.json).
+All 276 synthetic tests pass, including installed commands and native macOS watcher events. See the [release scope](docs/release/Release%20scope.md), [verification report](docs/release/Verification%20results.md), and [recorded measurements](docs/release/synthetic-performance.json).
 
 ## Development
 

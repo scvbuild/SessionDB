@@ -17,6 +17,8 @@ import os
 import re
 import shlex
 import shutil
+import sre_constants
+import sre_parse
 import sqlite3
 import stat
 import subprocess
@@ -8987,13 +8989,14 @@ def _full_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-def event_parts(row: sqlite3.Row, content: Any, full: bool = False) -> list[dict[str, Any]]:
+def event_parts(row: sqlite3.Row, content: Any, full: bool = False, redacted: bool = True) -> list[dict[str, Any]]:
     """The readable parts of one record, already redacted: messages, tool calls, tool results.
 
     Each part keeps its full text; display shortening happens later. `hidden` marks harness
     blocks and duplicate provider copies, which the conversation view leaves out. `full` keeps
     whole tool inputs, reasoning summaries, and records with no readable text as their fields."""
-    content = _redacted_json_string(content) if isinstance(content, str) else redact_value(content)
+    if redacted:
+        content = _redacted_json_string(content) if isinstance(content, str) else redact_value(content)
     role, category = row["role"], row["category"]
     parts: list[dict[str, Any]] = []
     if row["provider"] == "codex" and (category in CODEX_MESSAGE_COPIES or (
@@ -9311,6 +9314,8 @@ def _read_one_record(db: sqlite3.Connection, row: sqlite3.Row, session: str,
     offset = max(0, getattr(args, "offset", 0) or 0)
     piece, end = _readable_slice(text, offset, args.max_bytes)
     lines = [piece]
+    lines.append(f"[original records of this session, for counting or scripts: record-stream --session "
+                 f"{shlex.quote(session)} --output - (add --category <name> to narrow)]")
     if end < len(text):
         lines.append("[more: " + _read_hint(session, args, source=Path(row["source_path"]).name,
                                              line=row["line_number"], full=True, offset=end) + "]")
@@ -9630,6 +9635,10 @@ def render_search_text(result: dict[str, Any], db_path: Path | None = None,
         lines.append(f"[more results: bundle-page --format text --bundle {shlex.quote(str(bundle))} "
                      f"--offset {offset}{bound}]")
     coverage = result.get("coverage")
+    phrase = re.search(r'"([^"]{3,})"', query or "")
+    if phrase and entries and not getattr(args, "session", None):
+        lines.append("[every occurrence with its first and last time: grep -F "
+                     + shlex.quote(phrase.group(1)) + " -l]")
     affected = (coverage.get("affected_sources") or []) if isinstance(coverage, dict) else []
     for item in affected[:5]:
         lines.append(f"[not yet indexed: {item.get('path')} from byte {item.get('indexed_bytes', 0)}]")
@@ -9673,6 +9682,322 @@ def drop_after_until(result: dict[str, Any], args: argparse.Namespace, key: str)
     if len(kept) != len(result[key]):
         result = {**result, key: kept, "omitted_after_until": len(result[key]) - len(kept)}
     return result
+
+
+# ---------------------------------------------------------------- grep over the stored history
+# What agents otherwise do with grep, rg, or Python on transcript files: find every record whose
+# text matches a fixed string or a regular expression, with the text around each match. Words in
+# the pattern pick candidates through the search index; the pattern itself decides every match.
+
+# Commands agents use for history lookups. The agent retrieval guide must name each one: a command
+# agents are not told about is a command they do not use (tests enforce this).
+AGENT_COMMANDS = ("search-index", "read", "grep", "record-stream", "sessions")
+
+GREP_CONTEXT_CHARS = 150
+GREP_SHOWN_MATCHES = 40
+GREP_MATCHES_PER_RECORD = 3
+GREP_DEADLINE_SECONDS = 30.0
+GREP_SCAN_LIMIT = 200_000
+GREP_LISTED_SESSIONS = 50
+
+
+class GrepTimeout(Exception):
+    pass
+
+
+def _literal_branches(pattern: str, fixed: bool) -> list[list[tuple[str, bool, bool]]] | None:
+    """The literal runs every match must contain, per top-level alternative.
+
+    Each run is (text, starts_mid_pattern, ends_mid_pattern). None when an alternative has no
+    literal run, so no index lookup can bound the matches."""
+    if fixed:
+        return [[(pattern, True, True)]]
+    try:
+        parsed = sre_parse.parse(pattern)
+    except (sre_constants.error, re.error):
+        return None
+    items = list(parsed)
+    alternatives = (items[0][1][1] if len(items) == 1 and items[0][0] == sre_constants.BRANCH
+                    else [items])
+    branches = []
+    for alternative in alternatives:
+        runs, current, bounded = [], "", True
+        for op, value in list(alternative):
+            if op == sre_constants.LITERAL:
+                current += chr(value)
+                continue
+            if current:
+                runs.append((current, bounded, True))
+                current = ""
+            # An anchor or word boundary means the next literal starts a word.
+            bounded = op == sre_constants.AT
+        if current:
+            runs.append((current, bounded, True))
+        if not runs:
+            return None
+        branches.append(runs)
+    return branches
+
+
+def _grep_fts_expression(branches: list[list[tuple[str, bool, bool]]], origin: str,
+                         positional: bool = True) -> str | None:
+    """Index lookup for the literal runs, each as a phrase in word order; None when a branch
+    gives no usable word.
+
+    A run's first word is taken as a word start and a trailing word may continue (a prefix), so a
+    match inside a longer word is found only when the pattern says where the word starts."""
+    alternatives = []
+    for runs in branches:
+        parts = []
+        for text, _starts, _ends in runs:
+            words = list(re.finditer(r"[^\W_]+", text, re.UNICODE))
+            if not words:
+                continue
+            last = words[-1]
+            open_end = last.end() == len(text)
+            whole = text[:last.start()] if open_end else text
+            if re.search(r"[^\W_]", whole, re.UNICODE):
+                expression = fts_atom_expression(SearchAtom("phrase", whole), origin,
+                                                 preserve_occurrences=True, phrases=positional)
+                if expression:
+                    parts.append(f"({expression})")
+            if open_end and len(last.group(0)) >= 2:
+                expression = fts_atom_expression(SearchAtom("prefix", last.group(0)), origin)
+                if expression:
+                    parts.append(f"({expression})")
+        if not parts:
+            return None
+        alternatives.append(" AND ".join(parts))
+    return " OR ".join(f"({item})" for item in alternatives)
+
+
+def _record_text(db: sqlite3.Connection, row: sqlite3.Row, redacted: bool = True) -> str:
+    """Everything a record says, as the full read shows it; Codex duplicate copies left out.
+
+    Matching uses the stored text; only records that are shown are redacted."""
+    parts = event_parts(row, read_event_content(db, row), full=True, redacted=redacted)
+    return "\n".join(part["text"] for part in parts if part.get("hidden") != "copy")
+
+
+def grep_history(db_path: Path, args: argparse.Namespace) -> str:
+    started = time.monotonic()
+    deadline = started + float(getattr(args, "deadline_seconds", GREP_DEADLINE_SECONDS))
+    flags = re.IGNORECASE if args.ignore_case else 0
+    try:
+        matcher = re.compile(re.escape(args.pattern) if args.fixed_strings else args.pattern, flags)
+    except re.error as exc:
+        return f"pattern error: {exc}"
+    db = connect(db_path, read_only=True)
+    try:
+        clauses, values = _index_filter_clauses(args)
+        branches = _literal_branches(args.pattern, args.fixed_strings)
+        rowids: list[int] | None = None
+        with index_spellings(db):
+            positional = fts_index_is_positional(db)
+            expressions = ({origin: _grep_fts_expression(branches, origin, positional)
+                            for origin in PROJECTION_ORIGINS} if branches else {})
+            if any(expressions.values()):
+                rowids = list(fts_match_origins(db, expressions)[0])
+        scoped = bool(getattr(args, "session", None) or getattr(args, "since", None) or getattr(args, "until", None))
+        if rowids is None and not scoped:
+            return ("pattern error: the pattern has no word to look up (at least two letters or digits "
+                    "outside regex syntax); add a word, or limit the scan with --session or --since/--until")
+        select = ("SELECT e.rowid AS event_rowid,e.*,s.path AS source_path FROM events e "
+                  "JOIN sources s USING(source_id) WHERE ")
+        rows: list[sqlite3.Row] = []
+        if rowids is None:
+            rows = db.execute(select + (" AND ".join(clauses) or "1=1") + f" LIMIT {GREP_SCAN_LIMIT + 1}",
+                              values).fetchall()
+            if len(rows) > GREP_SCAN_LIMIT:
+                return ("pattern error: more than 200,000 records in scope to scan word by word; "
+                        "narrow --session or --since/--until, or add a word to the pattern")
+        else:
+            for start in range(0, len(rowids), 900):
+                chunk = rowids[start:start + 900]
+                rows.extend(db.execute(
+                    select + "e.rowid IN (" + ",".join("?" * len(chunk)) + ")"
+                    + "".join(" AND " + clause for clause in clauses), (*chunk, *values)).fetchall())
+                if time.monotonic() > deadline:
+                    raise GrepTimeout()
+        rows.sort(key=lambda row: (row["order_timestamp"] or "", row["source_id"], row["line_number"]))
+        if getattr(args, "reverse", False):
+            rows.reverse()
+        sessions: dict[tuple[str, str], dict[str, Any]] = {}
+        shown: list[tuple[sqlite3.Row, list[re.Match[str]], str]] = []
+        checked = 0
+        stopped_early = False
+        for row in rows:
+            if not args.sessions_only and len(shown) >= args.max_count:
+                stopped_early = True  # like grep -m: the first matches, not a full count
+                break
+            if time.monotonic() > deadline:
+                raise GrepTimeout()
+            checked += 1
+            raw_text = _record_text(db, row, redacted=False)
+            if args.sessions_only:
+                # Counts only: nothing from the record is shown, so it is not redacted.
+                text, found = "", list(matcher.finditer(raw_text))
+            elif matcher.search(raw_text):
+                text = _record_text(db, row)
+                found = list(matcher.finditer(text))
+            else:
+                found = []
+            if not found:
+                continue
+            key = (row["provider"], row["session_id"])
+            info = sessions.setdefault(key, {"count": 0, "first": row["order_timestamp"],
+                                             "last": row["order_timestamp"], "source": row["source_path"]})
+            info["count"] += len(found)
+            info["first"] = min(info["first"] or "", row["order_timestamp"] or "")
+            info["last"] = max(info["last"] or "", row["order_timestamp"] or "")
+            if len(shown) < args.max_count:
+                shown.append((row, found, text))
+        coverage = query_coverage(db, argparse.Namespace(
+            provider=getattr(args, "provider", None), project=getattr(args, "project", None),
+            session=getattr(args, "session", None), role=getattr(args, "role", None), tool=None, lineage=None,
+            since=getattr(args, "since", None), until=getattr(args, "until", None), text=None))
+    except GrepTimeout:
+        return ("grep stopped at its time limit before finishing — this is not a coverage gap and not a "
+                "no-match; narrow it: more or rarer words, --session, or a shorter --since/--until window")
+    finally:
+        db.close()
+
+    total = sum(info["count"] for info in sessions.values())
+    lines = [(f"first {len(shown)} matching records, {'newest' if getattr(args, 'reverse', False) else 'earliest'} "
+              f"first ({checked} of {len(rows)} candidate records checked; -l counts every session)")
+             if stopped_early else f"{total} matches in {len(sessions)} sessions ({checked} records checked)"]
+    if not sessions:
+        lines.append("no record matches; with complete coverage the stored text lacks this pattern "
+                     "(other wording may still hold the fact)")
+    titles = visible_session_titles(db_path, {f"s{n}": {"provider": provider, "session": session}
+                                              for n, (provider, session) in enumerate(sessions)},
+                                    until=getattr(args, "until", None))
+    title_of = {(value["provider"], value["session"]): (value.get("title") or {}).get("value") or "untitled"
+                for value in titles.values()}
+    until = getattr(args, "until", None)
+    if args.sessions_only:
+        listed = sorted(sessions.items(), key=lambda item: item[1]["first"] or "")
+        if getattr(args, "reverse", False):
+            listed.reverse()
+        for (provider, session), info in listed[:GREP_LISTED_SESSIONS]:
+            lines.append(f"{provider} {session} · {title_of.get((provider, session), 'untitled')} · "
+                         f"{info['count']} matches · first {(info['first'] or '')[:16]}Z · last {(info['last'] or '')[:16]}Z")
+        if len(listed) > GREP_LISTED_SESSIONS:
+            lines.append(f"[{len(listed) - GREP_LISTED_SESSIONS} more sessions; narrow with more words, "
+                         "--since/--until, or --reverse for the newest]")
+    else:
+        current = None
+        for row, found, text in shown:
+            key = (row["provider"], row["session_id"])
+            if key != current:
+                current = key
+                lines.append(f"{key[0]} {key[1]} · {title_of.get(key, 'untitled')}")
+            stamp = (row["order_timestamp"] or "")[:16].replace("T", " ")
+            who = f"tool {row['tool']}" if row["tool"] else (row["role"] or row["category"])
+            for match in found[:GREP_MATCHES_PER_RECORD]:
+                begin = max(0, match.start() - args.context)
+                end = min(len(text), match.end() + args.context)
+                snippet = " ".join(text[begin:end].split())
+                lines.append(f"   [L{row['line_number']} {stamp}Z {who}] " + ("…" if begin else "")
+                             + snippet + ("…" if end < len(text) else ""))
+            lines.append("   read: " + _command(f"read --session {shlex.quote(row['session_id'])}", {
+                "provider": row["provider"], "source": Path(row["source_path"]).name, "line": row["line_number"],
+                "evidence": True, "until": until}))
+    if isinstance(coverage, dict) and coverage.get("complete") is not True:
+        tails = [f"{item.get('path')} from byte {item.get('indexed_bytes', 0)}"
+                 for item in coverage.get("affected_sources") or []]
+        lines.append("[coverage incomplete: " + str(coverage.get("reason") or coverage.get("status") or "unknown")
+                     + ("; not yet indexed: " + "; ".join(tails[:5]) if tails else "") + "]")
+    elif not isinstance(coverage, dict):
+        lines.append(f"[coverage unknown: watcher status {coverage}]")
+    return "\n".join(lines)
+
+
+SESSIONS_LISTED = 60
+
+
+def list_sessions(db_path: Path, args: argparse.Namespace) -> str:
+    """Sessions active in a time window or whose title has the given words: what agents otherwise
+    find by listing transcript folders or grepping the Codex title index."""
+    db = connect(db_path, read_only=True)
+    try:
+        titled: dict[tuple[str, str], str] | None = None
+        if getattr(args, "title", None):
+            # Title records found through the index: every word must start a word of the title.
+            words = [word for word in re.findall(r"[^\W_]+", args.title, re.UNICODE) if len(word) >= 2]
+            if not words:
+                return "title error: give at least one word of two or more letters"
+            titled = {}
+            with index_spellings(db):
+                expressions = {origin: " AND ".join(
+                    f"({fts_atom_expression(SearchAtom('prefix', word), origin)})" for word in words)
+                    for origin in PROJECTION_ORIGINS}
+                rowids = list(fts_match_origins(db, expressions)[0])
+            wanted = [_accent_fold(word) for word in words]
+            for start in range(0, len(rowids), 900):
+                chunk = rowids[start:start + 900]
+                for row in db.execute(
+                        "SELECT e.* FROM events e WHERE e.rowid IN (" + ",".join("?" * len(chunk)) + ") "
+                        "AND e.category IN ('ai-title','custom-title','thread_name') ORDER BY e.order_timestamp",
+                        chunk):
+                    title = " ".join(_plain_text(read_event_content(db, row)).split())
+                    folded = _accent_fold(title)
+                    if all(re.search(r"(?<![^\W_])" + re.escape(word), folded) for word in wanted):
+                        titled[(row["provider"], row["session_id"])] = title
+            if not titled:
+                return "0 sessions"
+        clauses, values = [], []
+        if titled is not None:
+            # Through the sessions' own sources, so the source index is used instead of a full scan.
+            sources = [row[0] for key in titled for row in db.execute(
+                "SELECT source_id FROM sessions WHERE provider=? AND session_id=?", key)]
+            clauses.append("e.source_id IN (" + ",".join("?" * len(sources)) + ")")
+            values.extend(sources)
+            clauses.append("(e.provider,e.session_id) IN (VALUES " + ",".join("(?,?)" for _ in titled) + ")")
+            values.extend(item for key in titled for item in key)
+        for column, name in (("e.order_timestamp >= ?", "since"), ("e.order_timestamp <= ?", "until")):
+            if getattr(args, name, None):
+                clauses.append(column)
+                values.append(normalize_timestamp(getattr(args, name)) or getattr(args, name))
+        for column, name in (("e.provider", "provider"), ("e.project", "project")):
+            if getattr(args, name, None):
+                clauses.append(f"{column} LIKE ?")
+                values.append(f"%{getattr(args, name)}%")
+        rows = db.execute(
+            "SELECT e.provider,e.session_id,MIN(e.order_timestamp) AS first,MAX(e.order_timestamp) AS last,"
+            "COUNT(*) AS records,MAX(e.project) AS project FROM events e "
+            + ("WHERE " + " AND ".join(clauses) if clauses else "")
+            + " GROUP BY e.provider,e.session_id ORDER BY first", values).fetchall()
+    finally:
+        db.close()
+    found = [dict(row) for row in rows if row["session_id"]]
+    if titled is not None:
+        for row in found:
+            row["title"] = titled[(row["provider"], row["session_id"])]
+    else:
+        shown = found[-args.limit:] if getattr(args, "reverse", False) else found[:args.limit]
+        titles = visible_session_titles(db_path, {f"s{n}": {"provider": row["provider"], "session": row["session_id"]}
+                                                  for n, row in enumerate(shown)}, until=getattr(args, "until", None))
+        for n, row in enumerate(shown):
+            row["title"] = (titles[f"s{n}"].get("title") or {}).get("value") or "untitled"
+    if getattr(args, "reverse", False):
+        found.reverse()
+    lines = [f"{len(found)} sessions"]
+    for row in found[:args.limit]:
+        lines.append(f"{row['provider']} {row['session_id']} · {row.get('title') or 'untitled'} · {(row['first'] or '')[:16]}Z → "
+                     f"{(row['last'] or '')[:16]}Z · {row['records']} records · {row['project'] or ''}")
+    if len(found) > args.limit:
+        lines.append(f"[{len(found) - args.limit} more; narrow with --since/--until or --title, or --reverse for the newest]")
+    return "\n".join(lines)
+
+
+def _print_text(text: str) -> None:
+    """Print agent-facing text; a reader that stops early (`| head`) is not an error."""
+    try:
+        print(text)
+        sys.stdout.flush()
+    except BrokenPipeError:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -9761,6 +10086,29 @@ def main(argv: list[str] | None = None) -> int:
     p_read.add_argument("--show-hidden", action="store_true",
                         help="include harness text, setup records, and duplicate copies")
     p_read.add_argument("--max-bytes", type=_positive_int, default=READ_PAGE_BYTES)
+    p_grep = commands.add_parser(
+        "grep", help="grep the stored history: every record matching a regex or fixed string, with context")
+    p_grep.add_argument("pattern", help="regular expression (Python syntax), or a fixed string with -F")
+    p_grep.add_argument("-F", "--fixed-strings", action="store_true", help="the pattern is plain text")
+    p_grep.add_argument("-i", "--ignore-case", action="store_true")
+    p_grep.add_argument("-l", "--sessions-only", action="store_true",
+                        help="one line per matching session: count, first and last match time")
+    p_grep.add_argument("-C", "--context", type=int, default=GREP_CONTEXT_CHARS,
+                        help="characters shown on each side of a match")
+    p_grep.add_argument("-m", "--max-count", type=_positive_int, default=GREP_SHOWN_MATCHES,
+                        help="matching records shown (all are counted)")
+    p_grep.add_argument("--reverse", action="store_true", help="newest first")
+    for name in ("provider", "project", "session", "role", "since", "until"):
+        p_grep.add_argument("--" + name, **({"type": TIME_BOUND_TYPES[name]} if name in TIME_BOUND_TYPES else {}))
+    p_sessions = commands.add_parser(
+        "sessions", help="sessions active in a time window, or whose title has given words")
+    p_sessions.add_argument("--title", help="words the session title must contain")
+    p_sessions.add_argument("--since", type=_since_bound)
+    p_sessions.add_argument("--until", type=_until_bound)
+    p_sessions.add_argument("--provider")
+    p_sessions.add_argument("--project")
+    p_sessions.add_argument("--reverse", action="store_true", help="newest first")
+    p_sessions.add_argument("--limit", type=_positive_int, default=SESSIONS_LISTED)
     p_bundle = commands.add_parser("bundle-page")
     p_bundle.add_argument("--bundle", type=Path, required=True)
     p_bundle.add_argument("--case-id")
@@ -9810,7 +10158,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "bundle-page":
         page = drop_after_until(result_bundle_page(args.bundle, args, args.db), args, "entries")
         if getattr(args, "format", "json") == "text":
-            print(render_bundle_page_text(page, args))
+            _print_text(render_bundle_page_text(page, args))
         else:
             json_print(page)
         return 0
@@ -9832,13 +10180,13 @@ def main(argv: list[str] | None = None) -> int:
             result = search_index_entrypoint(args.db, args)
             delivered = {**bundle_if_oversized(args.db, result, args.bundle), "widened_from": original}
         if args.format == "text":
-            print(render_search_text(delivered, args.db, args))
+            _print_text(render_search_text(delivered, args.db, args))
         else:
             json_print(delivered)
         return 0
     if args.command == "read":
         try:
-            print(read_session_text(args.db, args))
+            _print_text(read_session_text(args.db, args))
         except ValueError as exc:
             print(f"sessiondb read: {exc}", file=sys.stderr)
             return 2
@@ -9846,11 +10194,31 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "details":
         json_print(drop_after_until(details_entrypoint(args.db, args), args, "events"))
         return 0
+    if args.command == "sessions":
+        _print_text(list_sessions(args.db, args))
+        return 0
+    if args.command == "grep":
+        _print_text(grep_history(args.db, args))
+        return 0
     if args.command == "record-stream":
         db = connect(args.db, read_only=True)
         try:
             db.execute("BEGIN")
-            json_print(write_record_stream(db, args.output, args))
+            if str(args.output) == "-":
+                # Original provider records, one per line, ready for jq or a script; the
+                # stream's coverage summary goes to stderr.
+                with tempfile.TemporaryDirectory() as folder:
+                    target = Path(folder) / "records.jsonl"
+                    summary = write_record_stream(db, target, args)
+                    with open(target, encoding="utf-8") as handle:
+                        for line in handle:
+                            record = json.loads(line).get("record")
+                            if record is not None:
+                                print(json.dumps(record.get("structure"), ensure_ascii=False))
+                print(json.dumps({"records": summary.get("records"), "coverage": summary.get("coverage")},
+                                 ensure_ascii=False), file=sys.stderr)
+            else:
+                json_print(write_record_stream(db, args.output, args))
         finally:
             db.close()
         return 0

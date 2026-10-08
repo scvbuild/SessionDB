@@ -486,3 +486,67 @@ class ReviewFindingsTest(_ReadingFixture):
     def test_read_hints_are_quoted_and_keep_the_provider(self):
         hint = sessiondb._read_hint("s1", _read_args(provider="codex"), source="my file.jsonl", line=4)
         self.assertEqual(hint, "read --session s1 --provider codex --source 'my file.jsonl' --line 4")
+
+
+class GrepAndRedirectTest(_ReadingFixture):
+    """Agents reach for grep and scripts on transcripts; SessionDB answers the same needs."""
+
+    def grep(self, pattern, **options):
+        values = dict(pattern=pattern, fixed_strings=False, ignore_case=False, sessions_only=False,
+                      context=40, max_count=40, reverse=False, provider=None, project=None,
+                      session=None, role=None, since=None, until=None)
+        values.update(options)
+        return sessiondb.grep_history(self.db_path, argparse.Namespace(**values))
+
+    def test_fixed_string_and_regex_find_records_with_context(self):
+        self.codex_session()
+        self.db.commit()
+        exact = self.grep("102 threads handed", fixed_strings=True)
+        self.assertIn("102 threads handed off", exact)
+        self.assertIn("read: read --session thread-a", exact)
+        self.assertIn("handed off", self.grep(r"threads\s+handed", ignore_case=True))
+        listed = self.grep("Archived 102", fixed_strings=True, sessions_only=True)
+        self.assertRegex(listed, r"codex thread-a · .* · 1 matches · first 2026-09-03T05:31Z")
+
+    def test_secrets_are_matched_but_never_shown(self):
+        self.codex_session()
+        self.db.commit()
+        self.assertNotIn("sk-live-secret", self.grep("list threads", fixed_strings=True))
+
+    def test_a_pattern_without_words_needs_a_scope(self):
+        self.codex_session()
+        self.db.commit()
+        self.assertTrue(self.grep(r"\d{3}").startswith("pattern error"))
+        self.assertIn("102", self.grep(r"\d{3} threads", session="thread-a"))
+
+    def test_literal_runs_follow_regex_alternatives(self):
+        branches = sessiondb._literal_branches("escalat|tag me", False)
+        self.assertEqual([[run[0] for run in branch] for branch in branches], [["escalat"], ["tag me"]])
+        self.assertIsNone(sessiondb._literal_branches(r"\d+", False))
+
+
+class SessionsListTest(_ReadingFixture):
+    def test_sessions_by_time_window_and_by_title(self):
+        self.codex_session()
+        self.ingest("codex", [{"id": "thread-a", "thread_name": "Archive handed-off sessions",
+                               "updated_at": "2026-09-03T05:31:35Z"}], sessiondb.CODEX_SESSION_INDEX_NAME)
+        self.db.commit()
+        args = dict(title=None, since="2026-09-03T00:00:00.000000Z", until="2026-09-03T23:59:59.999999Z",
+                    provider=None, project=None, reverse=False, limit=60)
+        listed = sessiondb.list_sessions(self.db_path, argparse.Namespace(**args))
+        self.assertIn("codex thread-a · Archive handed-off sessions · 2026-09-03T05:31Z", listed)
+        by_title = sessiondb.list_sessions(self.db_path, argparse.Namespace(
+            **{**args, "since": None, "until": None, "title": "handed archive"}))
+        self.assertTrue(by_title.startswith("1 sessions"))
+        none = sessiondb.list_sessions(self.db_path, argparse.Namespace(**{**args, "title": "invoice"}))
+        self.assertEqual(none, "0 sessions")
+
+
+class AgentGuideCoverageTest(unittest.TestCase):
+    def test_the_agent_guide_names_every_agent_command(self):
+        guide = Path(__file__).resolve().parents[3] / "global-config" / "all" / "sessiondb-retrieval.md"
+        if not guide.exists():
+            self.skipTest("the agent retrieval guide lives in the private repository")
+        text = guide.read_text(encoding="utf-8")
+        missing = [name for name in sessiondb.AGENT_COMMANDS if f"`{name}" not in text]
+        self.assertEqual(missing, [], "add these commands to global-config/all/sessiondb-retrieval.md")
