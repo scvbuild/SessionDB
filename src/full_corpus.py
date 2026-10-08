@@ -20,7 +20,11 @@ import sessiondb
 
 ROOTS = {
     "claude": (Path.home() / ".claude/projects",),
-    "codex": (Path.home() / ".codex/sessions", Path.home() / ".codex/archived_sessions"),
+    # Codex keeps thread titles only in its session index, beside the session folders.
+    "codex": (
+        Path.home() / ".codex/sessions", Path.home() / ".codex/archived_sessions",
+        Path.home() / ".codex" / sessiondb.CODEX_SESSION_INDEX_NAME,
+    ),
 }
 
 COMPACTION_MIN_RECLAIM_BYTES = 256 * 1024 * 1024

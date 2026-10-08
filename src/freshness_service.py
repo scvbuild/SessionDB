@@ -344,6 +344,18 @@ def main() -> int:
             if event.is_directory or any(path.endswith((".jsonl", ".desktop-released.json")) for path in paths):
                 changed.set()
 
+    class FileHandler(FileSystemEventHandler):
+        """Changes to one named file in a folder whose other files are not history."""
+
+        def __init__(self, name: str) -> None:
+            super().__init__()
+            self.name = name
+
+        def on_any_event(self, event: Any) -> None:
+            paths = (event.src_path, getattr(event, "dest_path", ""))
+            if not event.is_directory and any(Path(path).name == self.name for path in paths if path):
+                changed.set()
+
     observer = recovery_fsevents_observer(changed, recovery_events)
     handler = Handler()
     roots = [root for group in full_corpus.ROOTS.values() for root in group if root.exists()]
@@ -352,7 +364,10 @@ def main() -> int:
                         "error": "no transcript roots exist"}, state_dir)
         return 1
     for root in roots:
-        observer.schedule(handler, str(root), recursive=True)
+        if root.is_file():
+            observer.schedule(FileHandler(root.name), str(root.parent), recursive=False)
+        else:
+            observer.schedule(handler, str(root), recursive=True)
 
     def stop(_signum: int, _frame: Any) -> None:
         stopping.set()

@@ -42,3 +42,9 @@ The release records now live under `docs/release/`. Package configuration is con
 The reorganized candidate built both a source archive and a wheel using Python 3.9 and the minimum declared setuptools version, 61.0.0. The before/after wheel lists contain the same ten files; module and license bytes, parsed command entry points, dependency versions, Python requirement, and license metadata are preserved. The source archive keeps the release records under their new paths. Setuptools creates a minimal `setup.cfg` inside the source archive; the checkout does not require that file.
 
 All 229 synthetic tests passed in 17.637 seconds, including the installed-command flows and native watcher checks. `pip check` found no broken requirements. Retrieval and storage source files and retained tests were not changed by this reorganization.
+
+## Carry-across from the private build (8 October 2026)
+
+The private source at revision `69ca922` was carried across: `sessiondb.py` (with the public receipt namespace), `full_corpus.py`, and `snapshot_export.py`, plus the watcher's handling of Codex's title index in the local-only watcher. The extraction manifest records the new source hashes and retained tests. Private test changes were applied to the retained tests; two changes touched only tests this release omits. Two private test files (`test_agent_reading.py`, `test_search_noise_and_titles.py`) were added; they use only the retained engine.
+
+All 270 synthetic tests passed against a fresh install of this repository, including the installed-command flows and native watcher checks. `pip check` found no broken requirements.

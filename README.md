@@ -2,7 +2,7 @@
 
 **Let your AI agents remember what you already did, across Claude and Codex.**
 
-SessionDB turns your local Claude Code and Codex transcripts into one searchable history. An agent starting a new session can ask "what did we decide about X last week?" and get the relevant messages back, with a reference to exactly where each one came from. In a test on 28 real lookups, agents using SessionDB answered in about half the time of agents searching raw transcripts.
+SessionDB turns your local Claude Code and Codex transcripts into one searchable history. An agent starting a new session can ask "what did we decide about X last week?" and get the relevant messages back, with a reference to exactly where each one came from. In tests on real history questions, agents using SessionDB answered 2.7–5 times faster than agents searching raw transcripts, with about 30–40% fewer tokens.
 
 It runs entirely on your Mac, needs no server or account, and never moves or deletes your transcripts.
 
@@ -48,40 +48,40 @@ flowchart LR
 
 ### SessionDB vs raw transcripts
 
-**Agents using SessionDB answered about twice as fast, but not more accurately or more cheaply.** Same agent (Claude Opus 5.5), same 28 real history questions, one run each way:
+**Agents using SessionDB answered 2.7–5 times faster with fewer tokens.** With the question's context included, they were also right every time. Same agent (Claude Opus 5.5) on both sides, two sets of real history questions:
 
-| Per lookup (median) | SessionDB | Raw transcripts |
-| --- | ---: | ---: |
-| Answer fully correct | 25 of 28 | 28 of 28 |
-| Time to answer | **91 s** | 200 s |
-| Faster of the two | **25 of 28 lookups** | 3 of 28 |
-| Time until the needed facts reached the agent | **34 s** | 85 s |
-| Tokens processed (mostly cached input) | 294 k | 237 k |
-| Model cost | $0.48 | $0.42 |
-| Tool calls | 10 | 9.5 |
-| Time per tool call | 0.58 s | 0.19 s |
+| Per lookup (median) | With context: SessionDB | With context: Raw | Original requests: SessionDB | Original requests: Raw |
+| --- | ---: | ---: | ---: | ---: |
+| Answer fully correct | **40 of 40** | 37 of 40 | 27 of 28 | 28 of 28 |
+| Time to answer | **32.5 s** | 161.6 s | **72.8 s** | 200 s |
+| Answered within 40 s | **30 of 40** | 6 of 40 | 2 of 28 | — |
+| Tokens processed (mostly cached input) | **65 k** | 107 k | **160 k** | 237 k |
+| Tool calls | 3 | 7 | 6.5 | 9.5 |
+| Runs that also opened raw transcripts | 1 of 40 | — | 4 of 28 | — |
 
 ```mermaid
 xychart-beta
     title "Median time to answer (seconds)"
-    x-axis ["SessionDB", "Raw transcripts"]
+    x-axis ["With context: SessionDB", "With context: Raw", "Original: SessionDB", "Original: Raw"]
     y-axis "seconds" 0 --> 220
-    bar [91, 200]
+    bar [32.5, 161.6, 72.8, 200]
 ```
 
 What this means:
 
-- **Speed:** SessionDB was faster in 25 of 28 lookups, a median of 2.2 times faster per lookup. Agents found the right session sooner, then read it.
-- **Tokens and cost:** no saving. SessionDB lookups processed about 20% more tokens and cost about 14% more, because agents read more search results and full messages.
-- **Accuracy:** the raw-transcript agent never missed. Three SessionDB answers were incomplete: once the needed message never surfaced because system-prompt and tool-output records crowded the ranked results, and twice the agent had seen the fact but left it out.
+- **Questions with their context included** (the closest to asking an agent in a session that already knows what you mean): SessionDB was faster in 35 of 40 runs, at a median 0.20× the time and 0.61× the tokens per question.
+- **Original requests with little or no context** ("that issue from before", often the first message of a session): SessionDB was faster in 26 of 28, at 0.38× the time and 0.69× the tokens. One answer picked an older, similar incident than the one meant; raw search got that one right. Real use is likely between the two sets.
+- **Raw transcripts are rarely needed.** Most extra raw reads re-checked text SessionDB had already found; one computed per-turn token statistics, which SessionDB doesn't aggregate. The one held-out case was a search that ran out of time, since fixed.
 
 <details>
 <summary>How it was measured</summary>
 
-- **Questions:** 28 real requests from the author's Claude and Codex sessions (August to October 2026) that needed an earlier session to answer. Each has one or two facts confirmed in an earlier session record and not available from repository files at the time. 17 were the first message of a session; 11 came mid-session, with the earlier conversation included.
-- **Fair setup:** each agent saw history only up to the moment of the original request, through a cut copy of the transcripts. The SessionDB agent could also read those raw files, as its guide allows. Both had the same prompt frame, tools (shell, Grep, Glob, Read) and limits. Any run that touched files outside its own copy was invalid and rerun.
-- **Grading:** a separate Opus 5.5 grader judged each final answer against the expected facts without knowing which method produced it. Two questions whose expected answer turned out to be wrong were corrected after review, and both methods' answers were regraded.
-- **Limits:** one run per question per method, one model, one person's history, measured on the private build this release was extracted from. Codex agents were not tested.
+- **Questions:** real requests from the author's Claude and Codex sessions (June to October 2026) whose answer was in an earlier session, not in repository files at the time.
+  - *With context included:* 20 questions kept aside and never used while tuning SessionDB, each rewritten to stand alone while keeping the author's wording; two runs per question. An independent reviewer checked every expected fact against the source lines. Mixed English and Vietnamese, half Claude and half Codex.
+  - *Original requests:* 28 requests exactly as asked; 17 were the first message of a session, 11 included up to 20 earlier messages as plain text (no tool output or files, so less context than a real session). One run per question; the raw-transcript figures come from an earlier run on the same questions.
+- **Fair setup:** each agent saw history only up to the moment of the original request, through a frozen copy cut at that time. Both had the same prompt frame, tools (shell, Grep, Glob, Read) and limits; the SessionDB agent followed the instructions in the setup guide below and could still open raw files.
+- **Grading:** a separate Opus 5.5 grader judged each final answer against the expected facts without knowing which method produced it.
+- **Limits:** one model, one person's history, measured on 8 October 2026 with the private build this release is extracted from. Codex agents were not tested.
 
 </details>
 
@@ -113,11 +113,11 @@ Your results depend on how much history you have, your hardware, and how common 
 
 | Trade-off | What to expect |
 | --- | --- |
-| **Faster, not cheaper or more accurate** | In the benchmark above, SessionDB halved the time to an answer but used about 20% more tokens, and 3 of 28 answers were incomplete where raw search got all 28 |
-| **Agents still need good instructions** | Having the evidence in the database doesn't guarantee an agent uses it. Agents sometimes stop at a short passage instead of opening the full message, or leave out a fact they saw. The instructions in the setup guide below help |
+| **Vague requests can still pick the wrong session** | With little context, an agent may choose an older, similar incident than the one meant (1 of 28 in the benchmark above, where raw search got it right). Naming a date, project or detail avoids it |
+| **Agents still need good instructions** | Having the evidence in the database doesn't guarantee an agent uses it. Without the instructions in the setup guide below, agents read too much, fall back to raw transcripts, or leave out a fact they saw |
 | **Disk space** | SessionDB keeps its own copy of your history. It was smaller than the raw transcripts on the author's data, but that is not guaranteed, and you keep the transcripts too |
 | **Setup and first sync** | History must be synced before it can be searched; a large history takes a while the first time |
-| **Some searches are slow** | Very common words can take over 10 s on a large history. Search stops at 30 s by default and says so rather than returning a partial answer |
+| **Some searches are slow** | Very common words can take over 10 s on a large history. Search stops at 30 s by default and says it ran out of time, so the agent can narrow the search, rather than returning a partial answer |
 | **Coverage can be incomplete** | Unreadable, unsupported or still-changing files are reported, not hidden. Incomplete coverage can't prove that something never happened |
 | **Still sensitive data** | Results are redacted on a best-effort basis; the database itself contains everything. Don't share it |
 | **Platform** | Tested on macOS only. Linux and Windows are unverified |
@@ -145,7 +145,7 @@ Prefer `/usr/bin/python3` (the tested 3.9). A very new Python, such as 3.14, may
 
 Check: `~/.local/share/sessiondb/venv/bin/sessiondb --help` prints usage. Installing registers no background jobs.
 
-**3. Sync the user's history once.** This reads `~/.claude/projects`, `~/.codex/sessions` and `~/.codex/archived_sessions`, and builds the search index. It only reads transcripts; it never moves or deletes them.
+**3. Sync the user's history once.** This reads `~/.claude/projects`, `~/.codex/sessions`, `~/.codex/archived_sessions` and Codex's thread titles in `~/.codex/session_index.jsonl`, and builds the search index. It only reads transcripts; it never moves or deletes them.
 
 ```sh
 mkdir -p ~/.local/share/sessiondb/data
@@ -174,13 +174,14 @@ Without the watcher, searches still work: newer transcript lines are reported as
 
 ````markdown
 ## Past sessions (SessionDB)
-To find earlier Claude or Codex work, search SessionDB before reading raw transcripts:
+To find earlier Claude or Codex work, use SessionDB:
 `~/.local/share/sessiondb/venv/bin/sessiondb --db ~/.local/share/sessiondb/data/sessiondb.sqlite <command>`
-- Ranked search: `search-index --text '<2-4 distinctive words>'`. Words combine with AND; use `'"exact phrase"'`, `a OR b`, `NOT x`. Filters: `--since`, `--until`, `--session`, `--role`.
-- Passages are excerpts. Before answering from one marked `passage_truncated`, open it with `details`, copying the values from the result's `follow_up.details`, plus `--result-id <id> --readable`.
-- `r1` and `s1` are aliases for that search only; full session IDs are in the result's `sessions` map. Read a whole session with `query --clean --session <full ID>`.
-- `has_more` means more results are in the bundle: use `bundle-page`, don't rerun the search.
-- If `complete` is false, keep the verified results and read raw only the files in `coverage.affected_sources`, from their `indexed_bytes` offset. Only complete coverage can prove something is absent.
+1. Search: `search-index --format text --text '<2-4 distinctive words>'`. If the request gives a session ID, date, or exact string, filter by it (`--session`, `--since`/`--until`, quoted text). Words combine with AND; use `a OR b` and `'"exact phrase"'`; `--role user|assistant` limits the speaker.
+2. To find where an exact string first or ever appeared, search it in quotes with `--order chronological`. Inside one session, search it (`--session <id>`) instead of reading through it.
+3. Read when the shown evidence is not enough: run the session's ready `read … --line L --evidence` command. `--full` shows one record unabridged; `read --session <id> --tail 1` prints its title, time span, app, model and folder.
+4. When several sessions match, choose the one that fits every detail the request gives; prefer the most recent only when asked for the latest or current state.
+5. Before answering, check each requested claim against a record you read, and say plainly when one is not in the history.
+Open raw transcripts only when a result says `coverage incomplete` or `not yet indexed` (only those files, from the byte given), or for data SessionDB does not hold; say which files and why. With complete coverage, a no-match shows only that the indexed text lacks those words.
 ````
 
 ---
@@ -236,14 +237,15 @@ Readable details show redacted content without the provider envelope; the defaul
 | --- | --- | --- |
 | `ingest` | Import one provider transcript | `--provider`, source file path |
 | `build-search-index` | Build searchable projections for stored events | `--readiness-receipt` for large rebuilds |
-| `search-index` | Ranked passages with evidence references | `--text`, `--order`, `--limit`, scope filters |
-| `bundle-page` | Read more entries from a saved search bundle | `--bundle`, `--offset`, `--limit` |
+| `search-index` | Ranked passages with evidence references | `--text`, `--order`, `--limit`, `--format text`, scope filters |
+| `read` | A session's conversation as compact text: around a record, its evidence, one record in full, or its end | `--session`, `--line`, `--evidence`, `--full`, `--tail`, `--role`, `--tools` |
+| `bundle-page` | Read more entries from a saved search bundle | `--bundle`, `--offset`, `--limit`, `--format text` |
 | `details` | Retrieve selected messages and context | `--snapshot-id`, `--result-id`, `--bundle`, `--readable` |
 | `query` | List filtered events with paging | `--clean`, `--page-envelope`, `--limit`, `--offset` |
 | `record-stream` | Read stored provider records | See command help |
 | `report` | Inspect the database | See command help |
 
-Search and query filters include `--provider`, `--project`, `--session`, `--role`, `--tool`, `--lineage`, `--since`, and `--until`. Relevance order is the default; chronological order is available. Command help is the full reference:
+Search and query filters include `--provider`, `--project`, `--session`, `--role`, `--tool`, `--lineage`, `--since`, and `--until`; a date alone means that whole day (UTC). Relevance order is the default; chronological order is available. `--format text` groups results by session for agents to read, with a ready `read` command for each. Command help is the full reference:
 
 ```sh
 .venv/bin/sessiondb search-index --help
@@ -255,7 +257,7 @@ Search and query filters include `--provider`, `--project`, `--session`, `--role
 
 ### Watcher
 
-`sessiondb-freshness` discovers `~/.claude/projects`, `~/.codex/sessions`, and `~/.codex/archived_sessions`. With `--once` it syncs once; without it, it runs in the foreground until stopped. Status is written to `freshness/watcher_status.json` beside the database. No scheduler, messaging service, or repair agent is registered or launched.
+`sessiondb-freshness` discovers `~/.claude/projects`, `~/.codex/sessions`, `~/.codex/archived_sessions`, and Codex's title index `~/.codex/session_index.jsonl`. With `--once` it syncs once; without it, it runs in the foreground until stopped. Status is written to `freshness/watcher_status.json` beside the database. No scheduler, messaging service, or repair agent is registered or launched.
 
 Records being written may be reported as catching up. Persistent drift, unreadable evidence, failed migrations, and unsupported content-bearing shapes stay visible and can make affected queries incomplete. An issue with one provider does not invalidate evidence from the other.
 
@@ -286,7 +288,7 @@ SessionDB runs locally, but its stored content can include credentials, customer
 
 This is the first standalone release candidate, **`0.1.0rc1`**, under the [MIT license](LICENSE). It includes local sync, storage, search, evidence retrieval, export/backup, and a foreground macOS watcher. Automatic agent repair, external notifications, scheduled nightly audits, agent benchmarks, and the walkthrough app are not included.
 
-All 229 synthetic tests pass, including installed commands and native macOS watcher events. See the [release scope](docs/release/Release%20scope.md), [verification report](docs/release/Verification%20results.md), and [recorded measurements](docs/release/synthetic-performance.json).
+All 270 synthetic tests pass, including installed commands and native macOS watcher events. See the [release scope](docs/release/Release%20scope.md), [verification report](docs/release/Verification%20results.md), and [recorded measurements](docs/release/synthetic-performance.json).
 
 ## Development
 

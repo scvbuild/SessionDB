@@ -336,41 +336,23 @@ class SessionDBTest(unittest.TestCase):
                 "internal_chat_message_metadata_passthrough": {"turn_id": "turn-fixture"},
             },
         }
-        source = self.write("codex-compaction.jsonl", [row])
-        self.assertEqual(sessiondb.ingest(self.db, "codex", source)["issues"], 0)
-        event = self.db.execute("SELECT * FROM events").fetchone()
-        self.assertEqual(
-            (event["category"], event["supported"], event["content_hash"]),
-            ("compaction", 1, None),
-        )
-        self.assertEqual(sessiondb.read_event_structure(self.db, event), row)
+        # A row-level integer ordinal is accepted the same way.
+        for name, case in (("codex-compaction.jsonl", row), ("codex-compaction-ordinal.jsonl", {**row, "ordinal": 2})):
+            with self.subTest(name):
+                source = self.write(name, [case])
+                self.assertEqual(sessiondb.ingest(self.db, "codex", source)["issues"], 0)
+                event = self.db.execute("SELECT * FROM events ORDER BY rowid DESC LIMIT 1").fetchone()
+                self.assertEqual(
+                    (event["category"], event["supported"], event["content_hash"]),
+                    ("compaction", 1, None),
+                )
+                self.assertEqual(sessiondb.read_event_structure(self.db, event), case)
         args = argparse.Namespace(
             text="opaque-compaction-ciphertext-marker", provider="codex", project=None,
             session=None, role=None, tool=None, lineage=None, since=None, until=None,
             raw=False, limit=10, offset=0, before=0, after=0,
         )
         self.assertEqual(sessiondb.query(self.db, args), [])
-
-    def test_codex_compaction_accepts_row_level_ordinal(self):
-        row = {
-            "timestamp": "2026-09-12T05:57:33.000Z",
-            "type": "response_item",
-            "ordinal": 2,
-            "payload": {
-                "type": "compaction",
-                "id": "cmp_fixture",
-                "encrypted_content": "opaque-compaction-ciphertext-marker",
-                "internal_chat_message_metadata_passthrough": {"turn_id": "turn-fixture"},
-            },
-        }
-        source = self.write("codex-compaction-ordinal.jsonl", [row])
-        self.assertEqual(sessiondb.ingest(self.db, "codex", source)["issues"], 0)
-        event = self.db.execute("SELECT * FROM events").fetchone()
-        self.assertEqual(
-            (event["category"], event["supported"], event["content_hash"]),
-            ("compaction", 1, None),
-        )
-        self.assertEqual(sessiondb.read_event_structure(self.db, event), row)
 
     def test_codex_compaction_rejects_non_integer_ordinal(self):
         row = {
@@ -1347,24 +1329,42 @@ class SessionDBTest(unittest.TestCase):
         self.assertEqual(sessiondb.ingest(self.db, "claude", claude)["issues"], 0)
         self.assertEqual(sessiondb.ingest(self.db, "codex", codex)["issues"], 0)
 
-    def test_bridge_session_metadata_is_supported_and_contentless(self):
-        row = {
-            "type": "bridge-session",
-            "sessionId": "bridge-root",
-            "bridgeSessionId": "bridge-child",
-            "lastSequenceNum": 0,
-            "ownerAccountUuid": "11111111-1111-1111-1111-111111111111",
-            "ownerOrganizationUuid": "22222222-2222-2222-2222-222222222222",
-        }
-        source = self.write("bridge-session.jsonl", [row])
-        result = sessiondb.ingest(self.db, "claude", source)
-        self.assertEqual(result["issues"], 0)
-        event = self.db.execute("SELECT * FROM events").fetchone()
-        self.assertEqual(event["category"], "bridge-session")
-        self.assertEqual(event["supported"], 1)
-        self.assertIsNone(event["content_hash"])
-        self.assertEqual(sessiondb.read_event_structure(self.db, event), row)
-        self.assertIsNone(sessiondb.reconstruct(self.db, "claude", "bridge-root")[0]["content"])
+    def test_bridge_session_and_cost_state_metadata_are_supported_and_contentless(self):
+        rows = [
+            {
+                "type": "bridge-session",
+                "sessionId": "bridge-root",
+                "bridgeSessionId": "bridge-child",
+                "lastSequenceNum": 0,
+                "ownerAccountUuid": "11111111-1111-1111-1111-111111111111",
+                "ownerOrganizationUuid": "22222222-2222-2222-2222-222222222222",
+            },
+            {
+                "type": "cost-state",
+                "sessionId": "cost-root",
+                "totalCostUSD": 0,
+                "totalAPIDuration": 0,
+                "totalAPIDurationWithoutRetries": 0,
+                "totalToolDuration": 0,
+                "totalLinesAdded": 0,
+                "totalLinesRemoved": 0,
+                "totalDuration": 1551,
+                "startTime": 1790126150220,
+                "modelUsage": {},
+                "hasUnknownModelCost": False,
+            },
+        ]
+        for row in rows:
+            with self.subTest(row["type"]):
+                source = self.write(f"{row['type']}.jsonl", [row])
+                result = sessiondb.ingest(self.db, "claude", source)
+                self.assertEqual(result["issues"], 0)
+                event = self.db.execute("SELECT * FROM events ORDER BY rowid DESC LIMIT 1").fetchone()
+                self.assertEqual(event["category"], row["type"])
+                self.assertEqual(event["supported"], 1)
+                self.assertIsNone(event["content_hash"])
+                self.assertEqual(sessiondb.read_event_structure(self.db, event), row)
+                self.assertIsNone(sessiondb.reconstruct(self.db, "claude", row["sessionId"])[0]["content"])
 
     def test_worktree_lifecycle_metadata_is_supported_and_contentless(self):
         rows = [
@@ -1397,31 +1397,6 @@ class SessionDBTest(unittest.TestCase):
             [event["content"] for event in sessiondb.reconstruct(self.db, "claude", "worktree-root")],
             [None, None],
         )
-
-    def test_cost_state_metadata_is_supported_and_contentless(self):
-        row = {
-            "type": "cost-state",
-            "sessionId": "cost-root",
-            "totalCostUSD": 0,
-            "totalAPIDuration": 0,
-            "totalAPIDurationWithoutRetries": 0,
-            "totalToolDuration": 0,
-            "totalLinesAdded": 0,
-            "totalLinesRemoved": 0,
-            "totalDuration": 1551,
-            "startTime": 1790126150220,
-            "modelUsage": {},
-            "hasUnknownModelCost": False,
-        }
-        source = self.write("cost-state.jsonl", [row])
-        result = sessiondb.ingest(self.db, "claude", source)
-        self.assertEqual(result["issues"], 0)
-        event = self.db.execute("SELECT * FROM events").fetchone()
-        self.assertEqual(event["category"], "cost-state")
-        self.assertEqual(event["supported"], 1)
-        self.assertIsNone(event["content_hash"])
-        self.assertEqual(sessiondb.read_event_structure(self.db, event), row)
-        self.assertIsNone(sessiondb.reconstruct(self.db, "claude", "cost-root")[0]["content"])
 
     def test_atis_latch_is_strict_contentless_metadata(self):
         rows = [
@@ -3341,19 +3316,24 @@ class SessionDBTest(unittest.TestCase):
         ]
         codex_rows = [
             {"type": "session_meta", "timestamp": "2026-09-01T00:00:00Z",
-             "payload": {"id": "answer-x", "title": "Old proposal"}},
-            {"type": "session_meta", "timestamp": "2026-09-02T00:00:00Z",
-             "payload": {"id": "answer-x", "title": "Current proposal"}},
+             "payload": {"id": "answer-x"}},
             {"type": "event_msg", "timestamp": "2026-09-02T00:01:00Z",
              "payload": {"type": "agent_message", "message": "proposal lookup " +
                          ("details " * 22) + filename + " at 12% rate " + ("more " * 250)}},
             {"type": "session_meta", "payload": {"id": "untitled-x"}},
             {"type": "event_msg", "payload": {"type": "user_message", "message": "untitled marker"}},
         ]
+        # Codex keeps thread titles only in its session index; a rename appends a newer row.
+        index_rows = [
+            {"id": "answer-x", "thread_name": "Old proposal", "updated_at": "2026-09-01T00:00:00Z"},
+            {"id": "answer-x", "thread_name": "Current proposal", "updated_at": "2026-09-02T00:00:00Z"},
+        ]
         claude_path = self.write("answer-claude.jsonl", claude_rows)
         codex_path = self.write("answer-codex.jsonl", codex_rows)
+        index_path = self.write(sessiondb.CODEX_SESSION_INDEX_NAME, index_rows)
         sessiondb.ingest(self.db, "claude", claude_path)
         sessiondb.ingest(self.db, "codex", codex_path)
+        sessiondb.ingest(self.db, "codex", index_path)
 
         def delivered(term):
             result = sessiondb.search_index(self.db, self._search_args(text=term, mode="literal"))
@@ -3398,7 +3378,7 @@ class SessionDBTest(unittest.TestCase):
         self.assertIn(filename, detail["events"][0]["text"])
         self.assertNotIn("structure", detail["events"][0])
         self.assertEqual(detail["events"][0]["source"]["path"], str(codex_path.resolve()))
-        self.assertEqual(detail["events"][0]["source"]["line"], 3)
+        self.assertEqual(detail["events"][0]["source"]["line"], 2)
         exact = sessiondb.details_entrypoint(self.db_path, argparse.Namespace(
             snapshot_id=follow["snapshot_id"], result_ids=[hit["id"]],
             bundle=Path(follow["bundle"]), before=0, after=0, readable=False, manifest=None,

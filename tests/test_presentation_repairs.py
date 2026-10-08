@@ -18,8 +18,8 @@ class PresentationRepairsTest(unittest.TestCase):
         self.db.close()
         self.temp.cleanup()
 
-    def ingest(self, provider, rows):
-        path = self.root / f"{provider}.jsonl"
+    def ingest(self, provider, rows, name=None):
+        path = self.root / (name or f"{provider}.jsonl")
         path.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8")
         self.assertEqual(sessiondb.ingest(self.db, provider, path)["issues"], 0)
         return path
@@ -57,10 +57,14 @@ class PresentationRepairsTest(unittest.TestCase):
         content = "boundaryprobe " + "nội dung dài " * 7500 + ending
         self.ingest("codex", [
             {"type": "session_meta", "timestamp": "2026-09-01T00:00:00Z",
-             "payload": {"id": "long-x", "title": "Limit review"}},
+             "payload": {"id": "long-x"}},
             {"type": "event_msg", "timestamp": "2026-09-02T00:00:00Z",
              "payload": {"type": "agent_message", "message": content}},
         ])
+        # Codex keeps thread titles only in its session index.
+        self.ingest("codex", [{"id": "long-x", "thread_name": "Limit review",
+                               "updated_at": "2026-09-01T00:00:01Z"}],
+                    name=sessiondb.CODEX_SESSION_INDEX_NAME)
         result = self.delivered("boundaryprobe")
         hit = result["entries"][0]
         self.assertTrue(hit["passage_truncated"])
@@ -85,14 +89,13 @@ class PresentationRepairsTest(unittest.TestCase):
         self.assertIn("payload", exact["events"][0]["structure"])
 
     def test_title_scan_budget_reports_unknown_and_control_is_known(self):
-        rows = [{"type": "session_meta", "timestamp": "2026-09-01T00:00:00Z",
-                 "payload": {"id": "crowded-x", "title": "Old known title"}}]
-        rows += [{"type": "session_meta", "timestamp": "2026-09-02T00:00:00Z",
-                  "payload": {"id": "crowded-x", "title": {"invalid": i}}}
-                 for i in range(140)]
-        rows += [{"type": "event_msg", "payload": {"type": "agent_message",
-                   "message": "crowdedprobe observed"}}]
-        self.ingest("codex", rows)
+        rows = [{"type": "ai-title", "sessionId": "crowded-c", "timestamp": "2026-09-01T00:00:00Z",
+                 "aiTitle": "Old known title"}]
+        rows += [{"type": "ai-title", "sessionId": "crowded-c", "timestamp": "2026-09-02T00:00:00Z",
+                  "aiTitle": {"invalid": i}} for i in range(140)]
+        rows += [{"type": "assistant", "sessionId": "crowded-c",
+                  "message": {"role": "assistant", "content": "crowdedprobe observed"}}]
+        self.ingest("claude", rows)
         crowded = self.delivered("crowdedprobe")
         title = next(iter(crowded["sessions"].values()))["title"]
         self.assertEqual(title["status"], "unknown")

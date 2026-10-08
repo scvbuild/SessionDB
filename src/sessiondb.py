@@ -15,6 +15,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import sqlite3
 import stat
@@ -26,7 +27,7 @@ import unicodedata
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
@@ -66,6 +67,7 @@ CLAUDE_TYPES = {
 CLAUDE_ARTIFACT_TYPES = {
     "artifact-comment-monitor", "artifact-autoreact-ledger",
 }
+CODEX_SESSION_INDEX_NAME = "session_index.jsonl"
 CODEX_TYPES = {
     "session_meta", "event_msg", "response_item", "turn_context", "world_state",
     "compacted", "ghost_snapshot", "thread_rolled_back", "inter_agent_communication_metadata",
@@ -334,6 +336,11 @@ CREATE TABLE IF NOT EXISTS search_projection_refs (
 -- Narrow covering indexes let every search's integrity counts avoid scanning wide rows.
 CREATE INDEX IF NOT EXISTS events_count_idx ON events(supported);
 CREATE INDEX IF NOT EXISTS search_projection_refs_block_idx ON search_projection_refs(block_key);
+-- Session titles: only the title records, so a lookup reads the latest without scanning a session.
+CREATE INDEX IF NOT EXISTS events_title_idx ON events(source_id, session_id, order_timestamp)
+  WHERE category IN ('ai-title','custom-title','thread_name');
+-- Record times: a --since/--until search keeps only the window's matches before reading them.
+CREATE INDEX IF NOT EXISTS events_time_idx ON events(order_timestamp);
 CREATE TRIGGER IF NOT EXISTS events_projection_bd BEFORE DELETE ON events BEGIN
   DELETE FROM positional_projection_fts WHERE rowid=old.rowid;
   DELETE FROM search_projection_refs WHERE event_rowid=old.rowid;
@@ -364,7 +371,7 @@ def _command_outcome(result: dict[str, Any]) -> str:
         return "timeout"
     if reason.startswith("continuation_"):
         return "rejected"
-    if reason.startswith(("bundle_error:", "database_error:", "delivery_error:")):
+    if reason.startswith(("bundle_error:", "database_error:", "delivery_error:", "query_error:")):
         return "error"
     return "incomplete"
 
@@ -1373,10 +1380,27 @@ def codex_completed_item(
     return False, None, None, False, None, ()
 
 
+def codex_thread_name(row: dict[str, Any], path: Path) -> Parsed | None:
+    """A Codex thread-title row from `~/.codex/session_index.jsonl`; rollouts never hold titles."""
+    if path.name != CODEX_SESSION_INDEX_NAME or set(row) != {"id", "thread_name", "updated_at"}:
+        return None
+    if not all(isinstance(row[key], str) and row[key] for key in ("id", "updated_at")):
+        return None
+    if not isinstance(row["thread_name"], str):
+        return None
+    return Parsed(
+        row["id"], None, None, row["id"], row["updated_at"], "thread_name", None, None, False,
+        row["thread_name"], (("thread_name",),), (), True, None,
+    )
+
+
 def parse_codex(
     row: dict[str, Any], path: Path, meta: dict[str, Any],
     auto_extensions: frozenset[tuple[str, str]] = frozenset(),
 ) -> Parsed:
+    title = codex_thread_name(row, path)
+    if title is not None:
+        return title
     row_type = str(row.get("type") or "unknown")
     payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
     if row_type == "session_meta":
@@ -3470,6 +3494,8 @@ def matching_rows(db: sqlite3.Connection, args: argparse.Namespace) -> tuple[Ite
             clauses.append(f"{column} LIKE ? ESCAPE '\\'")
             escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             values.append(f"%{escaped}%")
+    if args.role:
+        clauses.append(ROLE_FILTER_CONVERSATION_CLAUSE)
     if args.project:
         clauses.append("e.project LIKE ? ESCAPE '\\'")
         escaped = args.project.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
@@ -3756,6 +3782,11 @@ def discover_transcript_sources(
             root = Path(root)
             if not root.exists():
                 continue
+            # A root may also name one file, such as the Codex session index.
+            if root.is_file():
+                if root.suffix == ".jsonl" and root.stat().st_size:
+                    result.append((provider, root.resolve(), "index"))
+                continue
             for path in root.rglob("*.jsonl"):
                 try:
                     is_source = path.is_file() and bool(path.stat().st_size)
@@ -3790,27 +3821,87 @@ def coverage_item_affects_query(item: Any, args: argparse.Namespace) -> bool:
 
 def appended_tail_affects_query(
     db: sqlite3.Connection, source_id: str, args: argparse.Namespace,
+    path: Path | None = None, start: int = 0,
 ) -> bool:
-    """Scope an appended tail by its source's indexed dimensions; tail events are newest."""
+    """Scope an appended tail by its source's indexed dimensions and, for --until, by its records."""
+    # A shared source (the Codex title index) can gain new sessions in its tail, so its indexed
+    # dimensions say nothing about the tail, whatever it holds today.
+    if path is None:
+        found = db.execute("SELECT path FROM sources WHERE source_id=?", (source_id,)).fetchone()
+        path_name = Path(found[0]).name if found else ""
+    else:
+        path_name = path.name
+    single_session = path_name != CODEX_SESSION_INDEX_NAME and db.execute(
+        "SELECT COUNT(DISTINCT session_id) FROM events WHERE source_id=?", (source_id,),
+    ).fetchone()[0] <= 1
     for column, requested in (
         ("project", getattr(args, "project", None)),
         ("session_id", getattr(args, "session", None)),
         ("parent_session_id", getattr(args, "lineage", None)),
     ):
-        if requested and not any(
+        if single_session and requested and not any(
             _query_filter_matches(value[0], requested)
             for value in db.execute(f"SELECT DISTINCT {column} FROM events WHERE source_id=?", (source_id,))
         ):
             return False
-    until = getattr(args, "until", None)
-    if until:
-        normalized_until = normalize_timestamp(until) or until
-        first_event = db.execute(
-            "SELECT MIN(order_timestamp) FROM events WHERE source_id=?", (source_id,),
-        ).fetchone()[0]
-        if first_event and first_event > normalized_until:
+    if getattr(args, "until", None) and path is not None:
+        # The record just before the tail dates any untimestamped lines at the tail's start.
+        previous = db.execute(
+            "SELECT order_timestamp FROM events WHERE source_id=? ORDER BY line_number DESC LIMIT 1",
+            (source_id,),
+        ).fetchone()
+        if region_after_until(path, start, args, previous[0] if previous else None):
             return False
     return True
+
+
+def region_after_until(path: Path, start: int, args: argparse.Namespace,
+                       previous: str | None = None) -> bool:
+    """True only when every record from byte `start` on is proven later than --until.
+
+    Each line must parse. A line without a timestamp takes the time of the nearest earlier
+    record (`previous` for lines at the region's start); one with no earlier record, an
+    unparsable line, or a region larger than the scan limit leaves the answer unknown (False)."""
+    until = _timestamp_epoch(normalize_timestamp(args.until) or args.until)
+    if until is None:
+        return False
+    try:
+        size = path.stat().st_size
+        if size - start > REGION_SCAN_MAX_BYTES:
+            return False
+        with open(path, "rb") as handle:
+            handle.seek(start)
+            region = handle.read(size - start)
+    except OSError:
+        return False
+    # A last line without a newline is ingested once it parses, so it is checked like the rest;
+    # one still being written does not parse and leaves the answer unknown.
+    lines = [line for line in region.split(b"\n") if line.strip()]
+    if not lines:
+        return False
+    current = _timestamp_epoch(normalize_timestamp(previous) or previous) if previous else None
+    for number, line in enumerate(lines):
+        if number % 2048 == 0:
+            check_query_deadline()
+        try:
+            row = json.loads(line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return False
+        stamp = row.get("timestamp") or row.get("updated_at") if isinstance(row, dict) else None
+        at = _timestamp_epoch(normalize_timestamp(stamp) or stamp) if isinstance(stamp, str) else None
+        current = at if at is not None else current
+        if current is None or current <= until:
+            return False
+    return True
+
+
+def _timestamp_epoch(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
 
 
 def _indexed_prefix_matches(path: Path, size: int, expected_hash: str) -> bool:
@@ -3874,13 +3965,15 @@ def live_source_drift(
         ) == (row["size_bytes"], row["mtime_ns"]):
             continue
         if row is None:
+            if getattr(args, "until", None) and region_after_until(path, 0, args):
+                continue
             item = {"path": str(path), "provider": provider, "indexed_bytes": 0,
                     "reason": "unindexed_source"}
         elif (
             row["status"] == "complete" and current.st_size > row["size_bytes"]
             and _indexed_prefix_matches(path, row["size_bytes"], row["source_hash"])
         ):
-            if not appended_tail_affects_query(db, row["source_id"], args):
+            if not appended_tail_affects_query(db, row["source_id"], args, path, row["size_bytes"]):
                 continue
             item = {"path": str(path), "provider": provider, "indexed_bytes": row["size_bytes"],
                     "reason": "source_tail"}
@@ -3933,7 +4026,7 @@ def drift_affects_query(
     })
     if not _query_filter_matches(row["provider"], getattr(args, "provider", None)):
         return False, fallback
-    if not appended_tail_affects_query(db, row["source_id"], args):
+    if not appended_tail_affects_query(db, row["source_id"], args, Path(row["path"]), row["size_bytes"]):
         return False, fallback
     try:
         current = Path(row["path"]).stat()
@@ -4309,6 +4402,8 @@ def _index_filter_clauses(args: argparse.Namespace) -> tuple[list[str], list[Any
             escaped = requested.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             clauses.append(f"{column} LIKE ? ESCAPE '\\'")
             values.append(f"%{escaped}%")
+    if getattr(args, "role", None):
+        clauses.append(ROLE_FILTER_CONVERSATION_CLAUSE)
     if getattr(args, "since", None):
         clauses.append("e.order_timestamp >= ?")
         values.append(normalize_timestamp(args.since) or args.since)
@@ -4373,10 +4468,18 @@ def _lexical_boundary_at(text: str, index: int, direction: int) -> bool:
     return True
 
 
+class QuerySyntaxError(ValueError):
+    """The search text is not a valid query; coverage is unaffected."""
+
+
 @dataclass(frozen=True)
 class SearchAtom:
     kind: str
     value: str
+
+
+# A word ending in `*` matches every word that starts with it (at least two letters first).
+PREFIX_WORD_RE = re.compile(r"[A-Za-z0-9\u00C0-\u024F\u1E00-\u1EFF]{2,}\*")
 
 
 def unquoted_search_term(value: str) -> str:
@@ -4388,12 +4491,19 @@ def unquoted_search_term(value: str) -> str:
 def search_query_tokens(text: str) -> list[Any]:
     tokens: list[Any] = []
     index = 0
+    depth = 0
     while index < len(text):
         if text[index].isspace():
             index += 1
             continue
-        if text[index] in "()":
-            tokens.append(text[index])
+        if text[index] == "(":
+            tokens.append("(")
+            depth += 1
+            index += 1
+            continue
+        if text[index] == ")" and depth:
+            tokens.append(")")
+            depth -= 1
             index += 1
             continue
         if text[index] == '"':
@@ -4405,14 +4515,22 @@ def search_query_tokens(text: str) -> list[Any]:
                 value.append(text[index])
                 index += 1
             if index >= len(text):
-                raise ValueError("unterminated quoted phrase")
+                raise QuerySyntaxError("unterminated quoted phrase")
             index += 1
             if not "".join(value).strip():
-                raise ValueError("empty quoted phrase")
+                raise QuerySyntaxError("empty quoted phrase")
             tokens.append(SearchAtom("phrase", "".join(value)))
             continue
         end = index
-        while end < len(text) and not text[end].isspace() and text[end] not in "()":
+        inner = 0  # parentheses opened inside this word
+        while end < len(text) and not text[end].isspace():
+            if text[end] == "(":
+                inner += 1
+            elif text[end] == ")":
+                if inner:
+                    inner -= 1
+                elif depth:
+                    break
             end += 1
         value = text[index:end]
         # Operators are upper case, so a lower-case `not` or `and` in a pasted sentence stays a
@@ -4424,6 +4542,8 @@ def search_query_tokens(text: str) -> list[Any]:
             tokens.append(value)
         elif near:
             tokens.append(("NEAR", int(near.group(1) or 10)))
+        elif PREFIX_WORD_RE.fullmatch(value):
+            tokens.append(SearchAtom("prefix", value[:-1]))
         else:
             tokens.append(SearchAtom("term", unquoted_search_term(value)))
         index = end
@@ -4433,13 +4553,13 @@ def search_query_tokens(text: str) -> list[Any]:
 def parse_search_query(text: str) -> Any:
     tokens = search_query_tokens(text)
     if not tokens:
-        raise ValueError("search query is empty")
+        raise QuerySyntaxError("search query is empty")
     position = 0
 
     def primary() -> Any:
         nonlocal position
         if position >= len(tokens):
-            raise ValueError("query ends with an operator")
+            raise QuerySyntaxError("query ends with an operator")
         token = tokens[position]
         if token == "NOT":
             position += 1
@@ -4448,13 +4568,13 @@ def parse_search_query(text: str) -> Any:
             position += 1
             node = parse_or()
             if position >= len(tokens) or tokens[position] != ")":
-                raise ValueError("unclosed query parenthesis")
+                raise QuerySyntaxError("unclosed query parenthesis")
             position += 1
             return node
         if isinstance(token, SearchAtom):
             position += 1
             return token
-        raise ValueError(f"unexpected query operator: {token}")
+        raise QuerySyntaxError(f"unexpected query operator: {token}")
 
     def parse_near() -> Any:
         nonlocal position
@@ -4484,7 +4604,7 @@ def parse_search_query(text: str) -> Any:
 
     result = parse_or()
     if position != len(tokens):
-        raise ValueError(f"unexpected query token: {tokens[position]}")
+        raise QuerySyntaxError(f"unexpected query token: {tokens[position]}")
     return result
 
 
@@ -4937,6 +5057,12 @@ def _atom_spans(
             ):
                 spans.append((candidate.start(), candidate.end()))
         return spans[:1] if first_only else spans
+    if atom.kind == "prefix":
+        # Same meaning as an FTS5 prefix token: a word starting with these letters, accents as typed.
+        haystack = projection.casefold()
+        stem = value.casefold()
+        return [(match.start(), match.end()) for match in re.finditer(
+            r"(?<![^\W_])" + re.escape(stem) + r"[^\W_]*", haystack, re.UNICODE)][: 1 if first_only else None]
     if atom.kind == "phrase":
         phrase_spans = _phrase_spans(
             projection, value, allow_accent_fallback=allow_accent_fallback,
@@ -5096,6 +5222,9 @@ def fts_atom_expression(
     atom: SearchAtom, origin: str, *, preserve_occurrences: bool = False, phrases: bool = False,
 ) -> str | None:
     """FTS candidates for one atom; with a positional index a phrase narrows to its word order."""
+    if atom.kind == "prefix":
+        stems = fts_candidate_parts(atom.value, preserve_occurrences=True)[0]
+        return f"{origin} : ({fts_phrase(stems[:1])}*)" if stems else None
     lexical, literal = fts_candidate_parts(
         atom.value, preserve_occurrences=False,
     )
@@ -5451,6 +5580,43 @@ SEARCH_ECHO_EXPRESSION = (
 )
 
 
+# A role filter asks for what someone said, so tool calls and tool results (Claude stores
+# results as user records) never match it.
+ROLE_FILTER_CONVERSATION_CLAUSE = "e.tool_event=0"
+# System prompts, developer instructions, session setup, and Codex compaction replays (copies of
+# earlier conversation) repeat across sessions and match almost any query; ranked search places
+# them after conversation and tool records.
+SETUP_ROLES = frozenset({"developer", "system"})
+SETUP_CATEGORIES = frozenset({"session_meta", "turn_context", "compacted"})
+
+
+def is_setup_record(entry: dict[str, Any]) -> bool:
+    return entry.get("role") in SETUP_ROLES or entry.get("category") in SETUP_CATEGORIES
+
+
+def demote_setup_records(entries: list[dict[str, Any]], role: str | None) -> list[dict[str, Any]]:
+    """Keep relevance order, moving setup records after the rest unless the role filter asks for them."""
+    if role and any(_query_filter_matches(name, role) for name in SETUP_ROLES):
+        return entries
+    return ([entry for entry in entries if not is_setup_record(entry)]
+            + [entry for entry in entries if is_setup_record(entry)])
+
+
+def finish_ranked_order(entries: list[dict[str, Any]], args: argparse.Namespace) -> list[dict[str, Any]]:
+    """Record hits per session; for the text view, spread the first places across sessions."""
+    counts: dict[tuple[str, str], int] = {}
+    for entry in entries:
+        key = (entry["provider"], entry["session"])
+        counts[key] = counts.get(key, 0) + 1
+    shared = getattr(args, "session_hits", None)
+    if isinstance(shared, dict):  # the entrypoint may work on a copy of args; keep the caller's dict
+        shared.clear()
+        shared.update(counts)
+    else:
+        args.session_hits = counts
+    return diversify_sessions(entries) if getattr(args, "diversify", False) else entries
+
+
 def demote_search_echoes(
     db: sqlite3.Connection, entries: list[dict[str, Any]], text: str,
 ) -> list[dict[str, Any]]:
@@ -5497,6 +5663,14 @@ def fts_fully_verifies(node: Any, positional: bool = False) -> bool:
     A positional index makes an ASCII quoted phrase exact, including hyphenated words such as
     `Rule-Writing`, so it needs no per-row Python re-check. An accent-keeping index also makes
     accented words and phrases exact, and unaccented ones through their spelled-out spellings."""
+    if isinstance(node, SearchAtom) and node.kind == "prefix":
+        # FTS5 prefix tokens already mean "a word starting with these letters"; without an FTS
+        # predicate (no indexable stem) nothing is verified.
+        # The older accent-folding index lets `bao*` match `báo`; only the accent-keeping one
+        # gives the same answer as the typed-accent check.
+        stems = fts_candidate_parts(node.value, preserve_occurrences=True)[0]
+        return (_INDEX_SPELLINGS.get() is not None
+                and len(stems) == 1 and stems[0] == node.value.casefold())
     if isinstance(node, SearchAtom) and _INDEX_SPELLINGS.get() is not None:
         if node.kind not in {"term", "phrase"} or LITERAL_SEARCH_RE.search(node.value):
             return False
@@ -5981,7 +6155,7 @@ def _search_index_matches(
         else [SearchAtom("term", text)]
     )
     if mode == "ranked" and not atoms:
-        raise ValueError("search query requires at least one positive term or phrase")
+        raise QuerySyntaxError("search query requires at least one positive term or phrase")
     fts_terms = (
         fts_candidate_terms(text, preserve_occurrences=True)
         if mode == "literal"
@@ -6024,9 +6198,30 @@ def _search_index_matches(
             "rowid INTEGER PRIMARY KEY) WITHOUT ROWID"
         )
         db.execute("DELETE FROM sessiondb_query_hits")
+        hit_rowids: Iterable[int] = fts_origins
+        # A common word matches across all history; reading each match only to drop it for its
+        # session or time costs one random read per match. Narrow the matches first by an index.
+        if getattr(args, "session", None) and clauses:
+            # The session's events come from its sources' index, a few thousand rows at most.
+            in_scope = {row[0] for row in db.execute(
+                "SELECT e.rowid FROM events e WHERE " + " AND ".join(clauses), tuple(values))}
+            hit_rowids = [rowid for rowid in fts_origins if rowid in in_scope]
+        elif (getattr(args, "since", None) or getattr(args, "until", None)) and db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name='events_time_idx'").fetchone():
+            bounds, bound_values = [], []
+            if getattr(args, "since", None):
+                bounds.append("order_timestamp >= ?")
+                bound_values.append(normalize_timestamp(args.since) or args.since)
+            if getattr(args, "until", None):
+                bounds.append("order_timestamp <= ?")
+                bound_values.append(normalize_timestamp(args.until) or args.until)
+            in_window = {row[0] for row in db.execute(
+                "SELECT rowid FROM events INDEXED BY events_time_idx WHERE " + " AND ".join(bounds),
+                tuple(bound_values))}
+            hit_rowids = [rowid for rowid in fts_origins if rowid in in_window]
         db.executemany(
             "INSERT INTO sessiondb_query_hits(rowid) VALUES(?)",
-            ((rowid,) for rowid in fts_origins),
+            ((rowid,) for rowid in hit_rowids),
         )
         clauses.append("e.rowid IN (SELECT rowid FROM sessiondb_query_hits)")
     sql = (
@@ -6159,7 +6354,9 @@ def _search_index_matches(
                 entry["order_timestamp"] or "", entry["provider"],
                 entry["session"], entry["source"]["line"], entry["result_id"],
             ))
-            entries = demote_search_echoes(db, demote_repeated_results(entries), text)
+            entries = demote_search_echoes(db, demote_setup_records(
+                demote_repeated_results(entries), getattr(args, "role", None)), text)
+            entries = finish_ranked_order(entries, args)
         projection_bytes = 0
         block_bytes = 0
         preview_block_cache: dict[int, bytes] = {}
@@ -6325,7 +6522,9 @@ def _search_index_matches(
                 digest((entry["provider"] + "\0" + entry["source"]["path"]).encode()),
                 entry["source"]["line"], entry["result_id"],
             ))
-            entries = demote_search_echoes(db, demote_repeated_results(entries), text)
+            entries = demote_search_echoes(db, demote_setup_records(
+                demote_repeated_results(entries), getattr(args, "role", None)), text)
+            entries = finish_ranked_order(entries, args)
         # Build one prefix containing up to the display target of distinct passages;
         # bundle pages hydrate the rest on demand.
         passage_limit = getattr(args, "passage_limit", INLINE_RESULT_LIMIT)
@@ -6999,11 +7198,20 @@ def bundle_if_oversized(
     return delivered
 
 
-def visible_session_titles(db_path: Path, sessions: dict[str, Any]) -> dict[str, Any]:
+# A query's --until also bounds the titles it shows, so a later rename cannot leak in.
+_TITLE_UNTIL: contextvars.ContextVar[str | None] = contextvars.ContextVar("title_until", default=None)
+
+
+def visible_session_titles(
+    db_path: Path, sessions: dict[str, Any], until: str | None = None,
+) -> dict[str, Any]:
     """Read explicit retained title records for displayed sessions only."""
     if not sessions:
         return sessions
-    record_limit = 128
+    until = until or _TITLE_UNTIL.get()
+    until = (normalize_timestamp(until) or until) if until else None
+    # Sessions can hold hundreds of title records; the newest few are enough.
+    record_limit = 8
     byte_limit = 65536
     deadline = time.monotonic() + 0.25
     try:
@@ -7036,9 +7244,12 @@ def visible_session_titles(db_path: Path, sessions: dict[str, Any]) -> dict[str,
                     "SELECT e.*,src.path AS source_path FROM sessions s "
                     "JOIN events e ON e.source_id=s.source_id AND e.session_id=s.session_id "
                     "JOIN sources src ON src.source_id=e.source_id "
+                    # Matches events_title_idx exactly, so only title records are read.
                     "WHERE s.provider=? AND s.session_id=? AND e.category IN "
-                    "('ai-title','custom-title','session_meta') "
-                    "LIMIT ?", (provider, session, record_limit + 1),
+                    "('ai-title','custom-title','thread_name') "
+                    + ("AND e.order_timestamp <= ? " if until else "")
+                    + "ORDER BY e.order_timestamp DESC, e.line_number DESC LIMIT ?",
+                    (provider, session, *([until] if until else []), record_limit),
                 ).fetchall()
             except sqlite3.Error as exc:
                 value["title"]["reason"] = (
@@ -7047,9 +7258,6 @@ def visible_session_titles(db_path: Path, sessions: dict[str, Any]) -> dict[str,
                 )
                 continue
             inspected_bytes = 0
-            if len(rows) > record_limit:
-                value["title"]["reason"] = "title_record_budget_exceeded"
-                continue
             rows.sort(key=lambda row: (
                 row["order_timestamp"] or "", row["source_id"],
                 row["line_number"], row["event_id"],
@@ -7061,7 +7269,7 @@ def visible_session_titles(db_path: Path, sessions: dict[str, Any]) -> dict[str,
                         break
                     if provider == "claude" and row["category"] not in {"ai-title", "custom-title"}:
                         continue
-                    if provider == "codex" and row["category"] != "session_meta":
+                    if provider == "codex" and row["category"] != "thread_name":
                         continue
                     inspected_bytes += row["structure_bytes"] or 0
                     if inspected_bytes > byte_limit:
@@ -7072,8 +7280,7 @@ def visible_session_titles(db_path: Path, sessions: dict[str, Any]) -> dict[str,
                         field = "customTitle" if row["category"] == "custom-title" else "aiTitle"
                         title = structure.get(field) or structure.get("title")
                     else:
-                        payload = structure.get("payload")
-                        title = payload.get("title") if isinstance(payload, dict) else None
+                        title = structure.get("thread_name")
                     if time.monotonic() >= deadline:
                         value["title"]["reason"] = "title_time_budget_exceeded"
                         break
@@ -7084,6 +7291,10 @@ def visible_session_titles(db_path: Path, sessions: dict[str, Any]) -> dict[str,
                                        "hash": row["raw_hash"], "event_id": row["event_id"]},
                         }
                         break
+                else:
+                    # Only the newest records are read; an older one may still hold a title.
+                    if len(rows) == record_limit:
+                        value["title"]["reason"] = "title_record_budget_exceeded"
             except sqlite3.Error as exc:
                 value["title"] = {"status": "unknown", "value": None,
                                   "reason": ("title_query_budget_exceeded"
@@ -7293,6 +7504,14 @@ def result_bundle_page(
                 ("session", args.session), ("role", args.role), ("tool", args.tool),
             )
         ):
+            continue
+        # Retained entries carry the tool name, not the tool-event flag; a tool call or result
+        # is not a conversation message, as in the database filters.
+        if args.role and entry.get("tool"):
+            continue
+        until = getattr(args, "until", None)
+        if until and (entry.get("order_timestamp") or entry.get("timestamp") or "") > (
+                normalize_timestamp(until) or until):
             continue
         if offset <= filtered_count < offset + limit:
             page.append(entry)
@@ -7529,6 +7748,8 @@ def _raw_filter_match(parsed: Parsed, provider: str, args: argparse.Namespace) -
         ("tool", parsed.tool, getattr(args, "tool", None)),
         ("lineage", parsed.parent_id, getattr(args, "lineage", None)),
     )
+    if getattr(args, "role", None) and parsed.tool_event:
+        return False, unknown
     for name, actual, requested in fields:
         if not requested:
             continue
@@ -7558,7 +7779,7 @@ def raw_manifest_search(manifest_path: Path, args: argparse.Namespace, reason: s
     order = getattr(args, "order", "relevance")
     tree = parse_search_query(text) if mode == "ranked" and text else None
     if tree is not None and not positive_search_atoms(tree):
-        raise ValueError("search query requires at least one positive term or phrase")
+        raise QuerySyntaxError("search query requires at least one positive term or phrase")
     needles = [text] if mode == "literal" else lexical_terms(text)
     if not text or not (needles or LITERAL_SEARCH_RE.search(text)):
         raise ValueError("raw fallback requires a non-empty searchable query")
@@ -7968,6 +8189,40 @@ def live_tails_servable(coverage: Any) -> bool:
     )
 
 
+def _time_bound(value: str, *, end: bool) -> str:
+    """A --since/--until value as a full UTC timestamp. A date or month means all of it, so
+    `--until 2026-08-10` keeps that day; a time without a zone is UTC, like stored times."""
+    month = re.fullmatch(r"(\d{4})-(\d{2})", value)
+    day = re.fullmatch(r"\d{4}-\d{2}-\d{2}", value)
+    try:
+        if month:
+            first = datetime(int(month.group(1)), int(month.group(2)), 1, tzinfo=timezone.utc)
+            following = (first + timedelta(days=32)).replace(day=1)
+            moment = following - timedelta(microseconds=1) if end else first
+        elif day:
+            moment = datetime.fromisoformat(value).replace(tzinfo=timezone.utc)
+            moment = moment + timedelta(days=1, microseconds=-1) if end else moment
+        else:
+            moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            moment = moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "expects a time such as 2026-08-10 or 2026-08-10T09:00Z; "
+            "for records around a line use --line L --context N") from None
+    return moment.astimezone(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _since_bound(value: str) -> str:
+    return _time_bound(value, end=False)
+
+
+def _until_bound(value: str) -> str:
+    return _time_bound(value, end=True)
+
+
+TIME_BOUND_TYPES = {"since": _since_bound, "until": _until_bound}
+
+
 def _positive_int(value: str) -> int:
     number = int(value)
     if number < 1:
@@ -7975,7 +8230,22 @@ def _positive_int(value: str) -> int:
     return number
 
 
+def validate_search_text(args: argparse.Namespace) -> None:
+    """Reject a malformed ranked query before any database, coverage, or fallback work."""
+    text = unicodedata.normalize("NFC", " ".join((getattr(args, "text", None) or "").split()))
+    if not text:
+        raise QuerySyntaxError("search-index requires non-empty --text")
+    if getattr(args, "mode", "ranked") == "ranked":
+        if not positive_search_atoms(parse_search_query(text)):
+            raise QuerySyntaxError("search query requires at least one positive term or phrase")
+
+
 def _search_index_entrypoint_impl(db_path: Path, args: argparse.Namespace) -> dict[str, Any]:
+    try:
+        validate_search_text(args)
+    except QuerySyntaxError as exc:
+        return {"protocol_version": RETRIEVAL_PROTOCOL_VERSION, "complete": False, "backend": "database",
+                "total": None, "entries": [], "reason": f"query_error: {exc}"}
     failure = None
     entry_lease = None
     snapshot_result = None
@@ -8016,7 +8286,15 @@ def _search_index_entrypoint_impl(db_path: Path, args: argparse.Namespace) -> di
             else:
                 coverage_only = False
                 if result["complete"] and manifest is None:
-                    coverage = query_coverage(db, args)
+                    deadline_token = _QUERY_DEADLINE.set(
+                        started + deadline_seconds
+                        if math.isfinite(deadline_seconds) and deadline_seconds > 0 else None)
+                    try:
+                        coverage = query_coverage(db, args)
+                    except QueryDeadlineExceeded:
+                        return _deadline_incomplete_result(deadline_seconds)
+                    finally:
+                        _QUERY_DEADLINE.reset(deadline_token)
                     if not coverage_is_current(coverage):
                         if isinstance(coverage, dict) and coverage.get("complete") is True:
                             coverage = {**coverage, "complete": False, "reason": "watcher_status_stale"}
@@ -8081,12 +8359,14 @@ def _search_index_entrypoint_impl(db_path: Path, args: argparse.Namespace) -> di
             return snapshot_result
         coverage = result.get("coverage")
         failure = coverage.get("reason") if isinstance(coverage, dict) else str(coverage or "database_incomplete")
+    except QuerySyntaxError as exc:
+        failure = f"query_error: {exc}"
     except (OSError, sqlite3.Error, ValueError, KeyError, RuntimeError, UnicodeError, zstd.ZstdError) as exc:
         failure = f"database_error: {exc}"
     finally:
         if entry_lease is not None:
             release_projection_pack_lease(entry_lease)
-    if getattr(args, "manifest", None):
+    if getattr(args, "manifest", None) and not str(failure or "").startswith("query_error:"):
         return raw_manifest_search(args.manifest, args, failure or "database_incomplete")
     return {
         "protocol_version": RETRIEVAL_PROTOCOL_VERSION, "complete": False,
@@ -8614,6 +8894,787 @@ def write_record_stream(db: sqlite3.Connection, path: Path, args: argparse.Names
             "source_reads": source_reads["attempts"]}
 
 
+# ---------------------------------------------------------------- agent reading (text output)
+# Agents read conversations, not provider envelopes: one text line per message, tool calls and
+# results collapsed to one line each. Nothing is deleted: harness-injected blocks, setup records,
+# and full tool output stay reachable (`--show-hidden`, or one record with `--line L --full`).
+
+READ_PAGE_BYTES = 24576
+EVIDENCE_HIT_CHARS = 3000
+EVIDENCE_CONTEXT_CHARS = 1500
+EVIDENCE_SCAN_RECORDS = 80
+CANONICAL_COPY_SECONDS = 300
+READ_MESSAGE_CHARS = 4000
+READ_TOOL_CHARS = 200
+READ_CONTEXT_ITEMS = 6
+SEARCH_TEXT_SESSIONS = 8
+SEARCH_TEXT_PASSAGE_CHARS = 600
+SEARCH_TEXT_SHOWN = 16
+SEARCH_EVIDENCE_BYTES = (5120, 3072)  # evidence windows for the top two sessions
+SESSION_SEARCH_RECORDS = 6
+SESSION_SEARCH_RECORD_CAP = 4000
+SESSION_SEARCH_RECORD_BYTES = 16384
+REGION_SCAN_MAX_BYTES = 16 * 1024 * 1024
+# Blocks the harness adds to a user turn, recognized by their opening wrapper. They are hidden
+# from the conversation view, never deleted.
+HARNESS_BLOCK_RE = re.compile(
+    r"^\s*(?:<(?:environment_context|user_instructions|permissions instructions|app-context|"
+    r"recommended_plugins|system-reminder|command-name|command-message|command-args|"
+    r"local-command-stdout|local-command-stderr|local-command-caveat|user-prompt-submit-hook|"
+    r"skills_instructions|collaboration_mode|turn_aborted|INSTRUCTIONS)[\s>]"
+    r"|# AGENTS\.md instructions|Caveat: The messages below|Base directory for this skill:)"
+)
+# Codex writes one message several ways; `response_item` messages are the canonical copy
+# (verified on 2,921 sessions: every session with typed user text has them).
+CODEX_MESSAGE_COPIES = frozenset({"user_message", "agent_message", "task_complete"})
+CODEX_DUPLICATE_ITEMS = frozenset({"CommandExecution", "UserMessage", "AgentMessage"})
+TEXT_BLOCK_TYPES = frozenset({"text", "input_text", "output_text", "summary_text"})
+
+
+def _redacted_json_string(value: str) -> Any:
+    """Tool arguments are often JSON inside a string; redact their fields structurally."""
+    if not value.lstrip().startswith(("{", "[")):
+        return redact(value)
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return redact(value)
+    return redact_value(parsed)
+
+
+def _block_text(block: Any) -> str:
+    if isinstance(block, str):
+        return block
+    if isinstance(block, dict):
+        kind = block.get("type")
+        if kind in TEXT_BLOCK_TYPES and isinstance(block.get("text"), str):
+            return block["text"]
+        if kind in {"image", "input_image"}:
+            return "[image]"
+        for key in ("text", "content", "output", "message", "summary"):
+            if block.get(key) is not None:
+                return _plain_text(block[key])
+    if isinstance(block, list):
+        return _plain_text(block)
+    return ""
+
+
+def _plain_text(value: Any) -> str:
+    if isinstance(value, list):
+        return "\n".join(part for part in (_block_text(block) for block in value) if part)
+    if isinstance(value, dict):
+        command = value.get("cmd") or value.get("command")
+        if command is not None and not isinstance(command, (dict, list)) or isinstance(command, list):
+            return " ".join(map(str, command)) if isinstance(command, list) else str(command)
+        return _block_text(value) or json.dumps(value, ensure_ascii=False)
+    return _block_text(value)
+
+
+def _one_line(text: str, limit: int) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[:limit] + f" […+{len(text) - limit} chars]"
+
+
+def _full_text(value: Any) -> str:
+    """Every field of a redacted value: the whole tool input, not just its command. Plain text
+    blocks stay text; anything with other fields is shown as JSON."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list) and all(
+            isinstance(block, str) or (isinstance(block, dict) and block.get("type") in TEXT_BLOCK_TYPES
+                                       and set(block) <= {"type", "text"}) for block in value):
+        return _plain_text(value)
+    return json.dumps(value, ensure_ascii=False)
+
+
+def event_parts(row: sqlite3.Row, content: Any, full: bool = False) -> list[dict[str, Any]]:
+    """The readable parts of one record, already redacted: messages, tool calls, tool results.
+
+    Each part keeps its full text; display shortening happens later. `hidden` marks harness
+    blocks and duplicate provider copies, which the conversation view leaves out. `full` keeps
+    whole tool inputs, reasoning summaries, and records with no readable text as their fields."""
+    content = _redacted_json_string(content) if isinstance(content, str) else redact_value(content)
+    role, category = row["role"], row["category"]
+    parts: list[dict[str, Any]] = []
+    if row["provider"] == "codex" and (category in CODEX_MESSAGE_COPIES or (
+            category == "item_completed" and isinstance(content, dict)
+            and content.get("type") in CODEX_DUPLICATE_ITEMS) or (
+            category == "item_completed" and role == "user")):
+        return [{"kind": "message", "role": role or "assistant", "text": _plain_text(content),
+                 "hidden": "copy"}]
+    has_tool_blocks = isinstance(content, list) and any(
+        isinstance(block, dict) and block.get("type") in {"tool_use", "tool_result"} for block in content)
+    if row["tool_event"] and not has_tool_blocks:
+        text = _full_text(content) if full else _plain_text(content)
+        result = category.endswith("_output") or role == "user"
+        return [{"kind": "tool_result" if result else "tool_call",
+                 "name": row["tool"] or category, "text": text, "hidden": None}]
+    blocks = content if isinstance(content, list) else [content]
+    for block in blocks:
+        if block is None or block == "":
+            continue
+        kind = block.get("type") if isinstance(block, dict) else None
+        if kind in {"thinking", "redacted_thinking", "reasoning"}:
+            summary = _plain_text(block.get("summary") or block.get("thinking") or "") if full else ""
+            if summary:
+                parts.append({"kind": "message", "role": "reasoning", "text": summary, "hidden": "reasoning"})
+            continue
+        if kind == "tool_use":
+            tool_input = block.get("input")
+            parts.append({"kind": "tool_call", "name": block.get("name") or row["tool"],
+                          "text": _full_text(tool_input) if full else _plain_text(tool_input), "hidden": None})
+        elif kind == "tool_result":
+            result_value = block.get("content")
+            if full and set(block) - {"type", "tool_use_id", "content"}:
+                text = _full_text({key: value for key, value in block.items() if key != "type"})
+            else:
+                text = _full_text(result_value) if full else _plain_text(result_value)
+            parts.append({"kind": "tool_result", "name": row["tool"], "text": text, "hidden": None})
+        else:
+            known = isinstance(block, str) or (
+                isinstance(block, dict) and kind in TEXT_BLOCK_TYPES and set(block) <= {"type", "text"})
+            text = _block_text(block) if known or not full else _full_text(block)
+            if not text:
+                continue
+            hidden = "harness" if role == "user" and HARNESS_BLOCK_RE.match(text) else None
+            parts.append({"kind": "message", "role": role or category, "text": text, "hidden": hidden})
+    if full and not parts and content not in (None, "", [], {}):
+        parts.append({"kind": "message", "role": category or "record", "text": _full_text(content),
+                      "hidden": "fields"})
+    return parts
+
+
+def render_part(row: sqlite3.Row, part: dict[str, Any], *, full: bool, show_hidden: bool) -> str:
+    stamp = (row["order_timestamp"] or "")[:16].replace("T", " ")
+    head = f"[L{row['line_number']} {stamp}Z"
+    if part["kind"] == "message":
+        text = part["text"].strip()
+        if not full and len(text) > READ_MESSAGE_CHARS:
+            text = text[:READ_MESSAGE_CHARS] + f" […+{len(text) - READ_MESSAGE_CHARS} chars]"
+        label = part["role"] + (f" hidden:{part['hidden']}" if part["hidden"] else "")
+        return f"{head} {label}] {text}"
+    arrow = "→" if part["kind"] == "tool_call" else "←"
+    text = part["text"] if full else _one_line(part["text"], READ_TOOL_CHARS)
+    return f"{head} tool] {arrow} {part['name'] or ''}: {text}"
+
+
+def resolve_session(db: sqlite3.Connection, session: str, provider: str | None = None) -> tuple[str, str]:
+    """A full session id from an id or a unique prefix of at least 8 characters."""
+    rows = db.execute(
+        "SELECT DISTINCT provider,session_id FROM sessions WHERE session_id=?"
+        + (" AND provider=?" if provider else ""), (session, provider) if provider else (session,),
+    ).fetchall()
+    if not rows and len(session) >= 8:
+        escaped = session.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        rows = db.execute(
+            "SELECT DISTINCT provider,session_id FROM sessions WHERE session_id LIKE ? ESCAPE '\\'"
+            + (" AND provider=?" if provider else "") + " LIMIT 6",
+            (escaped + "%", provider) if provider else (escaped + "%",),
+        ).fetchall()
+    if not rows:
+        raise ValueError(f"no session matches {session!r}")
+    if len(rows) > 1:
+        raise ValueError(f"{session!r} matches several sessions: "
+                         + ", ".join(f"{row[0]}:{row[1]}" for row in rows))
+    return rows[0][0], rows[0][1]
+
+
+def _session_rows(db: sqlite3.Connection, provider: str, session: str,
+                  args: argparse.Namespace) -> list[sqlite3.Row]:
+    """Every record of the session in one deterministic order, within the time filters."""
+    # The session's sources come from the sessions table, so the event lookup uses the
+    # (source_id, line_number) index instead of scanning every event.
+    sources = [row[0] for row in db.execute(
+        "SELECT source_id FROM sessions WHERE provider=? AND session_id=?", (provider, session))]
+    if not sources:
+        return []
+    clauses = [f"e.source_id IN ({','.join('?' * len(sources))})", "e.provider=?", "e.session_id=?"]
+    values: list[Any] = [*sources, provider, session]
+    if getattr(args, "since", None):
+        clauses.append("e.order_timestamp >= ?")
+        values.append(normalize_timestamp(args.since) or args.since)
+    if getattr(args, "until", None):
+        clauses.append("e.order_timestamp <= ?")
+        values.append(normalize_timestamp(args.until) or args.until)
+    return db.execute(
+        "SELECT e.*,s.path AS source_path FROM events e JOIN sources s USING(source_id) WHERE "
+        + " AND ".join(clauses) + " ORDER BY e.order_timestamp,e.source_id,e.line_number,e.event_id",
+        values,
+    ).fetchall()
+
+
+def _visible(row: sqlite3.Row, part: dict[str, Any], args: argparse.Namespace) -> bool:
+    if part["hidden"] == "copy" and not _has_canonical(row, part, args):
+        part = {**part, "hidden": None}  # no verified original: this copy is the only one
+    if part["hidden"] and not getattr(args, "show_hidden", False):
+        return False
+    if row["category"] in SETUP_CATEGORIES or row["role"] in SETUP_ROLES:
+        return bool(getattr(args, "show_hidden", False))
+    role = getattr(args, "role", None)
+    if part["kind"] != "message":
+        return not role and getattr(args, "tools", "brief") != "none"
+    if row["role"] not in {"user", "assistant"} and not row["tool_event"]:
+        return bool(getattr(args, "show_hidden", False))  # reasoning, titles, queue records
+    return not role or part["role"] == role
+
+
+def _normalized(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _canonical_messages(db: sqlite3.Connection, rows: list[sqlite3.Row]) -> dict[tuple[str, str], list[float]]:
+    """Codex's canonical messages by speaker and text, with their times, to verify copies against."""
+    found: dict[tuple[str, str], list[float]] = {}
+    for row in rows:
+        if row["provider"] != "codex" or row["category"] != "message" or row["role"] not in {"user", "assistant"}:
+            continue
+        at = _timestamp_epoch(normalize_timestamp(row["order_timestamp"]) or row["order_timestamp"]) or 0.0
+        for part in event_parts(row, read_event_content(db, row)):
+            if part["kind"] == "message":
+                found.setdefault((part["role"], _normalized(part["text"])), []).append(at)
+    return found
+
+
+def _has_canonical(row: sqlite3.Row, part: dict[str, Any], args: argparse.Namespace) -> bool:
+    messages = getattr(args, "canonical_messages", None)
+    messages = messages() if callable(messages) else messages
+    times = (messages or {}).get((part["role"], _normalized(part["text"])))
+    at = _timestamp_epoch(normalize_timestamp(row["order_timestamp"]) or row["order_timestamp"]) or 0.0
+    return bool(times) and any(abs(at - other) <= CANONICAL_COPY_SECONDS for other in times)
+
+
+def _command(words: str, options: dict[str, Any]) -> str:
+    """A shell-ready command: flags for true values, quoted values for the rest."""
+    parts = [words]
+    for name, value in options.items():
+        if value is True:
+            parts.append(f"--{name}")
+        elif value is not None and value is not False:
+            parts.append(f"--{name} {shlex.quote(str(value))}")
+    return " ".join(parts)
+
+
+def _read_hint(session: str, args: argparse.Namespace, **changes: Any) -> str:
+    """A continuation command that keeps every option of the current read."""
+    options = {"provider": getattr(args, "provider", None),
+               "source": getattr(args, "source", None), "role": getattr(args, "role", None),
+               "tools": None if getattr(args, "tools", "brief") == "brief" else args.tools,
+               "since": getattr(args, "since", None), "until": getattr(args, "until", None),
+               "show-hidden": getattr(args, "show_hidden", False), "full": getattr(args, "full", False)}
+    options.update(changes)
+    return _command(f"read --session {shlex.quote(session)}", options)
+
+
+def _resolve_anchor(rows: list[sqlite3.Row], line: int, source: str | None) -> int:
+    matches = [n for n, row in enumerate(rows) if row["line_number"] == line
+               and (not source or source in row["source_path"])]
+    files = {rows[n]["source_path"] for n in matches}
+    if not matches:
+        raise ValueError(f"no record at line {line}" + (f" of {source}" if source else "")
+                         + " in this session (it may be outside the time filters or changed)")
+    if len(files) > 1:
+        raise ValueError(f"line {line} exists in several files of this session; add --source with "
+                         + " or ".join(sorted(Path(path).name for path in files)))
+    return matches[0]
+
+
+def _coverage_line(db: sqlite3.Connection, provider: str, session: str, args: argparse.Namespace) -> str | None:
+    coverage = query_coverage(db, argparse.Namespace(
+        provider=provider, project=None, session=session, role=None, tool=None, lineage=None,
+        since=getattr(args, "since", None), until=getattr(args, "until", None), text=None))
+    if not isinstance(coverage, dict):
+        return f"[coverage unknown: watcher status {coverage}]"
+    if coverage.get("complete") is True:
+        return None
+    tails = [f"{item.get('path')} from byte {item.get('indexed_bytes', 0)}"
+             for item in coverage.get("affected_sources") or []]
+    return ("[coverage incomplete: " + (coverage.get("reason") or coverage.get("status") or "unknown")
+            + ("; not yet indexed: " + "; ".join(tails) if tails else "")
+            + ("; issues: " + "; ".join(map(str, coverage.get("issues") or [])) if coverage.get("issues") else "")
+            + "]")
+
+
+def session_metadata_text(db: sqlite3.Connection, rows: list[sqlite3.Row]) -> str:
+    """Who started the session, with which model, where: the facts agents otherwise grep for."""
+    found: dict[str, str] = {}
+    for row in rows[:400]:
+        if len(found) >= 4:
+            break
+        wanted = (row["category"] in {"session_meta", "turn_context"}
+                  or (row["provider"] == "claude" and row["category"] in {"user", "assistant"}))
+        if not wanted:
+            continue
+        try:
+            structure = read_event_structure(db, row)
+        except (ValueError, KeyError, OSError, sqlite3.Error, zstd.ZstdError):
+            continue
+        payload = structure.get("payload") if isinstance(structure.get("payload"), dict) else {}
+        message = structure.get("message") if isinstance(structure.get("message"), dict) else {}
+        for label, value in (
+            ("app", payload.get("originator") or structure.get("entrypoint")),
+            ("model", payload.get("model") or message.get("model")),
+            ("version", payload.get("cli_version") or structure.get("version")),
+            ("cwd", payload.get("cwd") or structure.get("cwd")),
+        ):
+            if isinstance(value, str) and value and label not in found:
+                found[label] = value
+    return "".join(f" · {label} {found[label]}" for label in ("app", "model", "version", "cwd") if label in found)
+
+
+def _evidence_records(db: sqlite3.Connection, rows: list[sqlite3.Row], anchor: int,
+                      args: argparse.Namespace) -> list[str]:
+    """The hit in full (up to a cap), the user request before it, and the assistant reply after it."""
+    def parts(n: int) -> list[dict[str, Any]]:
+        return event_parts(rows[n], read_event_content(db, rows[n]))
+
+    def message_index(indexes: range, role: str, stop_role: str | None = None) -> int | None:
+        for n in indexes:
+            found = [part["role"] for part in parts(n) if part["kind"] == "message" and not part["hidden"]]
+            if role in found:
+                return n
+            if stop_role and stop_role in found:
+                return None  # a new request began before any reply
+        return None
+
+    hit = parts(anchor)
+    if hit and all(part["hidden"] == "copy" and _has_canonical(rows[anchor], part, args) for part in hit):
+        wanted = {(part["role"], " ".join(part["text"].split())) for part in hit}
+        for n in sorted(range(max(0, anchor - 12), min(len(rows), anchor + 13)), key=lambda n: abs(n - anchor)):
+            if n != anchor and any((part["role"], " ".join(part["text"].split())) in wanted and not part["hidden"]
+                                   for part in parts(n)):
+                anchor = n
+                break
+    chosen = {anchor}
+    before = message_index(range(anchor - 1, max(-1, anchor - EVIDENCE_SCAN_RECORDS), -1), "user")
+    after = message_index(range(anchor + 1, min(len(rows), anchor + EVIDENCE_SCAN_RECORDS)), "assistant",
+                          stop_role="user")
+    if getattr(args, "neighbors", True):
+        chosen.update(n for n in (before, after) if n is not None)
+        if rows[anchor]["tool_event"] and anchor > 0 and rows[anchor - 1]["tool_event"]:
+            chosen.add(anchor - 1)  # the nearest earlier tool call, usually the one that produced it
+    out: list[str] = []
+    budget = args.max_bytes
+    left_out = 0
+    anchor_shown = False
+    for n in sorted(chosen):
+        row = rows[n]
+        cap = EVIDENCE_HIT_CHARS if n == anchor else EVIDENCE_CONTEXT_CHARS
+        for part in parts(n):
+            if part["hidden"] and n != anchor:
+                continue
+            text = _window_around_match(part["text"].strip(), getattr(args, "query", None), cap)
+            rendered = render_part(row, {**part, "text": text}, full=True, show_hidden=True)
+            # The hit's first part is always shown; everything else fits the byte budget.
+            if len(rendered.encode()) > budget and (n != anchor or anchor_shown):
+                left_out += n == anchor
+                continue
+            anchor_shown = anchor_shown or n == anchor
+            out.append(rendered)
+            budget -= len(rendered.encode()) + 1
+    if left_out:
+        out.append(f"[{left_out} more parts of L{rows[anchor]['line_number']}: add --full]")
+    return out
+
+
+def _window_around_match(text: str, query: str | None, cap: int) -> str:
+    """At most `cap` characters, keeping the first place a query word occurs."""
+    if len(text) <= cap:
+        return text
+    start = 0
+    if query:
+        folded = _accent_fold(text)
+        positions = [folded.find(_accent_fold(word)) for word in re.findall(r"[^\W_]{3,}", query, re.UNICODE)]
+        positions = [position for position in positions if position >= 0]
+        if positions:
+            start = max(0, min(positions) - cap // 4)
+    end = min(len(text), start + cap)
+    start = max(0, end - cap)
+    return (f"[…{start} chars before] " if start else "") + text[start:end] + (
+        f" […+{len(text) - end} chars: add --full]" if end < len(text) else "")
+
+
+def _read_one_record(db: sqlite3.Connection, row: sqlite3.Row, session: str,
+                     args: argparse.Namespace) -> list[str]:
+    """One record in full, including hidden blocks and tool output, paged by characters."""
+    parts = event_parts(row, read_event_content(db, row), full=True)
+    if not parts:
+        # A metadata record has no content; its stored fields are the record.
+        try:
+            structure = redact_value(read_event_structure(db, row))
+        except (ValueError, KeyError, OSError, sqlite3.Error, zstd.ZstdError):
+            structure = None
+        if structure:
+            parts = [{"kind": "message", "role": row["category"] or "record",
+                      "text": json.dumps(structure, ensure_ascii=False), "hidden": "fields"}]
+    text = "\n".join(render_part(row, part, full=True, show_hidden=True) for part in parts) or (
+        f"[L{row['line_number']} {row['category']}] (no readable text)")
+    offset = max(0, getattr(args, "offset", 0) or 0)
+    piece, end = _readable_slice(text, offset, args.max_bytes)
+    lines = [piece]
+    if end < len(text):
+        lines.append("[more: " + _read_hint(session, args, source=Path(row["source_path"]).name,
+                                             line=row["line_number"], full=True, offset=end) + "]")
+    return lines
+
+
+def read_session_text(db_path: Path, args: argparse.Namespace) -> str:
+    """A session's conversation as compact text: around a record, at its end, or after a cursor."""
+    db = connect(db_path, read_only=True)
+    try:
+        provider, session = resolve_session(db, args.session, getattr(args, "provider", None))
+        # One search result reads the same session for several evidence windows; it passes a
+        # cache so the session's records and canonical messages load once.
+        cache = getattr(args, "session_cache", None)
+        key = (provider, session, getattr(args, "since", None), getattr(args, "until", None))
+        loaded = cache.get(key) if cache is not None else None
+        if loaded is None:
+            loaded = {"rows": _session_rows(db, provider, session, args), "canonical": None}
+            if cache is not None:
+                cache[key] = loaded
+        rows = loaded["rows"]
+
+        def canonical() -> dict[tuple[str, str], list[float]]:
+            # Built on first need: only a Codex copy has to be checked against its original.
+            if loaded["canonical"] is None:
+                loaded["canonical"] = _canonical_messages(db, rows)
+            return loaded["canonical"]
+
+        args.canonical_messages = canonical
+        if getattr(args, "embedded", False):
+            lines = ["#"]  # inside a search result, which already shows the session's title
+        else:
+            titles = visible_session_titles(db_path, {"s": {"provider": provider, "session": session}},
+                                            until=getattr(args, "until", None))
+            title = titles["s"]["title"].get("value") or "untitled"
+            first = (rows[0]["order_timestamp"] or "")[:16] if rows else "-"
+            last = (rows[-1]["order_timestamp"] or "")[:16] if rows else "-"
+            lines = [f"# {provider} session {session} · {title} · {first}Z → {last}Z"
+                     + session_metadata_text(db, rows)]
+        anchor = None
+        line = getattr(args, "line", None)
+        if line is not None:
+            anchor = _resolve_anchor(rows, line, getattr(args, "source", None))
+            if getattr(args, "full", False) or getattr(args, "evidence", False):
+                lines += (_read_one_record(db, rows[anchor], session, args) if getattr(args, "full", False)
+                          else _evidence_records(db, rows, anchor, args))
+                if not getattr(args, "embedded", False):
+                    coverage = _coverage_line(db, provider, session, args)
+                    if coverage:
+                        lines.append(coverage)
+                return "\n".join(lines)
+        rendered: dict[int, list[str]] = {}
+
+        def render(n: int) -> list[str]:
+            if n not in rendered:
+                row = rows[n]
+                parts = event_parts(row, read_event_content(db, row))
+                rendered[n] = [render_part(row, part, full=getattr(args, "full", False), show_hidden=False)
+                               for part in parts if _visible(row, part, args) or n == anchor]
+            return rendered[n]
+
+        budget = args.max_bytes - len(lines[0].encode()) - 200
+        chosen: list[int] = []
+        if anchor is not None:
+            # The anchor first, then neighbours outward until the context count or budget runs out.
+            row = rows[anchor]
+            if not any(_visible(row, part, args) for part in event_parts(row, read_event_content(db, row))):
+                lines.append(f"[L{row['line_number']} is outside the filters or hidden; shown because it was asked for]")
+            chosen, spent = [anchor], sum(len(text.encode()) + 1 for text in render(anchor))
+            before, after, shown = anchor - 1, anchor + 1, 0
+            while shown < 2 * args.context and (before >= 0 or after < len(rows)):
+                progressed = False
+                for side in ("before", "after"):
+                    n = before if side == "before" else after
+                    if not 0 <= n < len(rows):
+                        continue
+                    if side == "before":
+                        before -= 1
+                    else:
+                        after += 1
+                    cost = sum(len(text.encode()) + 1 for text in render(n))
+                    if cost and spent + cost > budget:
+                        continue
+                    if cost:
+                        chosen.append(n)
+                        spent += cost
+                        shown += 1
+                    progressed = True
+                if not progressed:
+                    break
+            chosen.sort()
+            next_after = chosen[-1] if chosen[-1] < len(rows) - 1 else None
+        else:
+            if getattr(args, "tail", None):
+                candidates = range(len(rows) - 1, -1, -1)
+            else:
+                after_event = getattr(args, "after_event", None)
+                start = 0
+                if after_event:
+                    found = [n for n, row in enumerate(rows) if row["event_id"].startswith(after_event)]
+                    if not found:
+                        raise ValueError("continuation point no longer exists; read again from a search hit")
+                    start = found[0] + 1
+                candidates = range(start, len(rows))
+            spent, shown, next_after = 0, 0, None
+            for n in candidates:
+                texts = render(n)
+                if not texts:
+                    continue
+                cost = sum(len(text.encode()) + 1 for text in texts)
+                if (spent + cost > budget and chosen) or (getattr(args, "tail", None) and shown >= args.tail):
+                    next_after = None if getattr(args, "tail", None) else chosen[-1]
+                    break
+                chosen.append(n)
+                spent += cost
+                shown += 1
+            chosen.sort()
+        for n in chosen:
+            lines.extend(render(n))
+        hidden = sum(1 for n in chosen for part in event_parts(rows[n], read_event_content(db, rows[n]))
+                     if not _visible(rows[n], part, args)) if not getattr(args, "show_hidden", False) else 0
+        if hidden:
+            lines.append(f"[{hidden} hidden parts (harness text, setup, copies): add --show-hidden]")
+        if next_after is not None and next_after < len(rows) - 1:
+            lines.append("[more: " + _read_hint(session, args, **{"after-event": rows[next_after]["event_id"][:16]}) + "]")
+        coverage = _coverage_line(db, provider, session, args)
+        if coverage:
+            lines.append(coverage)
+        return "\n".join(lines)
+    finally:
+        db.close()
+
+
+_ENVELOPE_PIECE_RE = re.compile(
+    r"^(?:\d{4}-\d\d-\d\dT[\d:.]+Z?|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}"
+    r"|(?:toolu|call|msg|ctco|exec|fc|rs)_[\w-]+|exec-[0-9a-f-]{36})$"
+)
+
+
+def readable_passage(passage: str) -> str:
+    """A passage without standalone envelope ids and timestamps; words and numbers stay."""
+    pieces = [piece.strip() for piece in passage.split(" … ")]
+    kept = [piece for piece in pieces if piece and not _ENVELOPE_PIECE_RE.match(piece)]
+    return " … ".join(kept) or passage
+
+
+def diversify_sessions(entries: list[dict[str, Any]], limit: int = SEARCH_TEXT_SHOWN) -> list[dict[str, Any]]:
+    """Relevance order, but the first `limit` places go round-robin across sessions."""
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for entry in entries:
+        groups.setdefault((entry["provider"], entry["session"]), []).append(entry)
+    front: list[dict[str, Any]] = []
+    depth = 0
+    while len(front) < limit and any(len(group) > depth for group in groups.values()):
+        for group in groups.values():
+            if len(group) > depth and len(front) < limit:
+                front.append(group[depth])
+        depth += 1
+    chosen = {id(entry) for entry in front}
+    return front + [entry for entry in entries if id(entry) not in chosen]
+
+
+def _evidence_window(db_path: Path, provider: str, session: str, source: str | None, line: int,
+                     until: str | None, max_bytes: int, full: bool = False, query: str | None = None,
+                     neighbors: bool = True, cache: dict[Any, Any] | None = None) -> list[str]:
+    args = argparse.Namespace(session=session, provider=provider, line=line, source=source, context=2,
+                              tail=None, after_event=None, since=None, until=until, tools="brief",
+                              role=None, full=full, show_hidden=False, max_bytes=max_bytes, offset=0,
+                              evidence=not full, embedded=True, query=query, neighbors=neighbors,
+                              session_cache=cache)
+    try:
+        text = read_session_text(db_path, args)
+    except (ValueError, sqlite3.Error, OSError):
+        return []
+    return ["   " + item for item in text.splitlines()[1:]
+            if not re.match(r"\[(?:coverage |more: |\d+ hidden parts )", item)]
+
+
+def render_bundle_page_text(page: dict[str, Any], args: argparse.Namespace) -> str:
+    """One line per further result, with the read command for it."""
+    entries = page.get("entries") or []
+    until = getattr(args, "until", None)
+    bound = f" --until {shlex.quote(until)}" if until else ""
+    head = f"results {args.offset + 1}–{args.offset + len(entries)}"
+    coverage = page.get("coverage")
+    rejection = page.get("rejection") if isinstance(page.get("rejection"), dict) else {}
+    reason = (page.get("reason") or rejection.get("reason")
+              or (coverage.get("reason") or coverage.get("status") if isinstance(coverage, dict) else coverage))
+    if page.get("complete") is False:
+        head += f" (incomplete: {reason or 'see issues'}"
+        head += f"; {len(page['issues'])} passages could not be read)" if page.get("issues") else ")"
+    lines = [head]
+    for entry in entries:
+        session = entry.get("session") or "?"
+        source = entry.get("source") if isinstance(entry.get("source"), dict) else {}
+        line = source.get("line") or entry.get("line")
+        name = Path(source.get("path") or "").name
+        who = f"tool {entry['tool']}" if entry.get("tool") else (entry.get("role") or entry.get("category"))
+        stamp = (entry.get("timestamp") or entry.get("order_timestamp") or "")[:16].replace("T", " ")
+        lines.append(f"{entry.get('provider', '?')} {session} [L{line} {stamp}Z {who}] "
+                     + _one_line(readable_passage(entry.get("passage") or ""), SEARCH_TEXT_PASSAGE_CHARS))
+        lines.append("   read: " + _command(f"read --session {shlex.quote(str(session))}", {
+            "provider": entry.get("provider"), "source": name or None, "line": line,
+            "evidence": True, "until": until}))
+    if page.get("has_more"):
+        # The next page continues the same filtered sequence, so it keeps every filter.
+        lines.append("[more results: " + _command("bundle-page --format text", {
+            "bundle": args.bundle, "offset": args.offset + len(entries),
+            **{name: getattr(args, name, None) for name in ("provider", "project", "session", "role", "tool")},
+            "until": until}) + "]")
+    return "\n".join(lines)
+
+
+def render_search_text(result: dict[str, Any], db_path: Path | None = None,
+                       args: argparse.Namespace | None = None) -> str:
+    """Search results grouped by session as compact text, with evidence for the top sessions."""
+    entries = result.get("entries") or []
+    sessions = result.get("sessions") or {}
+    sources = result.get("sources") or {}
+    total = result.get("total")
+    head = f"{total if total is not None else result.get('indexed_total', '?')} results"
+    stopped = result.get("coverage") if isinstance(result.get("coverage"), dict) else {}
+    if stopped.get("reason") == "query_deadline_exceeded" or result.get("reason") == "query_deadline_exceeded":
+        return ("search stopped at its time limit before finishing — this is not a coverage gap and not "
+                "a no-match; search again narrower: rarer or more words, a phrase, --session, or a shorter "
+                "--since/--until window")
+    if str(result.get("reason") or "").startswith("query_error:"):
+        return (f"query error: {result['reason'][len('query_error:'):].strip()} — fix the query and search "
+                "again; this is not a coverage gap")
+    if result.get("complete") is False:
+        head += f" (coverage incomplete: {result.get('reason') or 'see affected sources'})"
+    if result.get("widened_from"):
+        head += f" — no record had all of: {result['widened_from']}; showing records with any of them"
+    lines = [head]
+    if not entries:
+        lines.append("no matches; try other words, fewer words, or a phrase in quotes")
+    key_of = {alias: ((info or {}).get("provider"), (info or {}).get("session") or alias)
+              for alias, info in sessions.items()}
+    counts = getattr(args, "session_hits", None) or {}
+    order: list[tuple[Any, Any]] = []
+    for entry in entries:
+        key = key_of.get(entry.get("session"), (None, entry.get("session")))
+        if key not in order:
+            order.append(key)
+    by_key = {key_of[alias]: info for alias, info in sessions.items()}
+    until = getattr(args, "until", None) if args is not None else None
+    query = getattr(args, "text", None) if args is not None else None
+    bound = f" --until {shlex.quote(until)}" if until else ""
+    shown: set[tuple[Any, Any, Any]] = set()
+    session_cache: dict[Any, Any] = {}
+
+    def record_key(entry: dict[str, Any]) -> tuple[Any, Any, Any]:
+        return (key_of.get(entry.get("session"), entry.get("session")), entry.get("source"), entry.get("line"))
+
+    def passage_line(entry: dict[str, Any]) -> str:
+        who = f"tool {entry['tool']}" if entry.get("tool") else (entry.get("role") or entry.get("category"))
+        stamp = (entry.get("timestamp") or "")[:16].replace("T", " ")
+        return (f"   [L{entry.get('line')} {stamp}Z {who}] "
+                + _one_line(readable_passage(entry.get("passage") or ""), SEARCH_TEXT_PASSAGE_CHARS))
+    for number, key in enumerate(order[:SEARCH_TEXT_SESSIONS], 1):
+        provider, session_id = key
+        info = by_key.get(key) or {}
+        title = (info.get("title") or {}).get("value") or "untitled"
+        own, seen_records = [], set()
+        for entry in entries:
+            record = (entry.get("source"), entry.get("line"))
+            if key_of.get(entry.get("session")) == key and record not in seen_records:
+                seen_records.add(record)
+                own.append(entry)
+        date = (own[0].get("timestamp") or "")[:10] if own else ""
+        lines.append(f"{number}. {provider} {session_id} · {title}" + (f" · {date}" if date else "")
+                     + f" · {counts.get(key, len(own))} hits")
+        top = own[0] if own else None
+        source_name = Path((sources.get(top.get("source")) or {}).get("path") or "").name if top else ""
+        if own and getattr(args, "session", None) and db_path is not None:
+            # Searching inside one session: show each matching record whole, not an excerpt.
+            budget = SESSION_SEARCH_RECORD_BYTES
+            for entry in own[:SESSION_SEARCH_RECORDS]:
+                shown.add(record_key(entry))
+                name = Path((sources.get(entry.get("source")) or {}).get("path") or "").name
+                record = _evidence_window(db_path, provider, session_id, name or None, entry.get("line"),
+                                          until, min(budget, SESSION_SEARCH_RECORD_CAP), query=query,
+                                          neighbors=False, cache=session_cache)
+                # A record the reader cannot open (a tail not yet indexed) keeps its passage.
+                record = record or [passage_line(entry)]
+                lines.extend(record)
+                budget -= sum(len(item.encode()) + 1 for item in record)
+                if budget <= 0:
+                    break
+            lines.append("   read: " + _command(f"read --session {shlex.quote(str(session_id))}", {
+                "provider": provider, "until": until}) + " --line <L> --evidence (or --full)")
+            continue
+        if top and number <= len(SEARCH_EVIDENCE_BYTES) and db_path is not None:
+            window = _evidence_window(db_path, provider, session_id, source_name or None,
+                                      top.get("line"), until, SEARCH_EVIDENCE_BYTES[number - 1], query=query,
+                                      cache=session_cache)
+            if window:
+                lines.append(f"   evidence around L{top.get('line')} (nearby records, not necessarily the answer):")
+                lines.extend(window)
+                shown.add(record_key(top))
+                own = own[1:]
+        for entry in own[:2]:
+            lines.append(passage_line(entry))
+            shown.add(record_key(entry))
+        if top:
+            lines.append("   read: " + _command(f"read --session {shlex.quote(str(session_id))}", {
+                "provider": provider, "source": source_name or None, "line": top.get("line"),
+                "evidence": True, "until": until}))
+    others = [(key, hits) for key, hits in sorted(counts.items(), key=lambda item: -item[1]) if key not in order]
+    if others:
+        lines.append("other sessions with hits: " + "; ".join(
+            f"{provider} {session_id} ({hits})" for (provider, session_id), hits in others[:8]))
+    bundle = (result.get("bundle") or {}).get("path")
+    unshown = next((n for n, entry in enumerate(entries) if record_key(entry) not in shown), None)
+    if bundle and (result.get("has_more") or unshown is not None):
+        offset = unshown if unshown is not None else result.get("shown_through", len(entries))
+        lines.append(f"[more results: bundle-page --format text --bundle {shlex.quote(str(bundle))} "
+                     f"--offset {offset}{bound}]")
+    coverage = result.get("coverage")
+    affected = (coverage.get("affected_sources") or []) if isinstance(coverage, dict) else []
+    for item in affected[:5]:
+        lines.append(f"[not yet indexed: {item.get('path')} from byte {item.get('indexed_bytes', 0)}]")
+    if len(affected) > 5:
+        lines.append(f"[{len(affected) - 5} more not-yet-indexed sources: run search-index without --format text]")
+    return "\n".join(lines)
+
+
+_STRUCTURAL_QUERY_RE = re.compile(r"[/\\()<>{}\[\]*=:@]")
+_OPERATOR_RE = re.compile(r"\b(?:AND|OR|NOT|NEAR(?:/\d+)?)\b")
+
+
+def literal_query(text: str) -> str:
+    """Words holding a path, tag, or other symbols are searched as exact text; other words and any
+    query already using quotes or operators stay as written."""
+    if '"' in text or _OPERATOR_RE.search(text):
+        return text
+    return " ".join(
+        '"' + word + '"' if _STRUCTURAL_QUERY_RE.search(word) and not PREFIX_WORD_RE.fullmatch(word) else word
+        for word in text.split())
+
+
+def widened_query(text: str, result: dict[str, Any]) -> str | None:
+    """When no record has all the words, search for any of them instead (text view only)."""
+    words = text.split()
+    if (result.get("entries") or result.get("complete") is not True or result.get("total") != 0
+            or len(words) < 2
+            or '"' in text or _OPERATOR_RE.search(text) or text.lstrip().startswith("-")):
+        return None
+    return " OR ".join(words)
+
+
+def drop_after_until(result: dict[str, Any], args: argparse.Namespace, key: str) -> dict[str, Any]:
+    """Leave out records later than --until, so a historical lookup stays historical."""
+    until = getattr(args, "until", None)
+    if not until or not isinstance(result.get(key), list):
+        return result
+    limit = normalize_timestamp(until) or until
+    kept = [item for item in result[key]
+            if not isinstance(item, dict) or (item.get("order_timestamp") or item.get("timestamp") or "") <= limit]
+    if len(kept) != len(result[key]):
+        result = {**result, key: kept, "omitted_after_until": len(result[key]) - len(kept)}
+    return result
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", type=Path, required=True)
@@ -8624,7 +9685,7 @@ def main(argv: list[str] | None = None) -> int:
     p_ingest.add_argument("paths", nargs="+", type=Path)
     p_query = commands.add_parser("query")
     for name in ("text", "provider", "project", "session", "role", "tool", "lineage", "since", "until"):
-        p_query.add_argument("--" + name)
+        p_query.add_argument("--" + name, **({"type": TIME_BOUND_TYPES[name]} if name in TIME_BOUND_TYPES else {}))
     p_query.add_argument("--raw", action="store_true")
     p_query.add_argument("--clean", action="store_true")
     p_query.add_argument("--before", type=int, default=0, help="include preceding source events around each hit")
@@ -8662,7 +9723,7 @@ def main(argv: list[str] | None = None) -> int:
                          help=argparse.SUPPRESS)
     p_index.add_argument("--order", choices=("relevance", "chronological"), default="relevance")
     for name in ("provider", "project", "session", "role", "tool", "lineage", "since", "until"):
-        p_index.add_argument("--" + name)
+        p_index.add_argument("--" + name, **({"type": TIME_BOUND_TYPES[name]} if name in TIME_BOUND_TYPES else {}))
     p_index.add_argument("--bundle", type=Path)
     p_index.add_argument("--case-id", help="caller-owned case identity for safe continuations")
     p_index.add_argument("--manifest", type=Path, help="bounded frozen-source fallback manifest")
@@ -8673,16 +9734,46 @@ def main(argv: list[str] | None = None) -> int:
     p_index.add_argument(
         "--limit", dest="passage_limit", type=_positive_int, default=INLINE_RESULT_LIMIT,
     )
+    p_index.add_argument("--format", choices=("json", "text"), default="json",
+                         help="text: results grouped by session, typed messages first")
+    p_read = commands.add_parser(
+        "read", help="a session's conversation as compact text (one call after a search)")
+    p_read.add_argument("--session", required=True, help="session id or a unique prefix of 8+ characters")
+    p_read.add_argument("--provider")
+    p_read.add_argument("--line", "--around", dest="line", type=int,
+                        help="the record at this source line (a search result's L number), with context")
+    p_read.add_argument("--source", help="file name (or part of its path) when the session has several files")
+    p_read.add_argument("--context", type=int, default=READ_CONTEXT_ITEMS,
+                        help="records on each side of --line")
+    p_read.add_argument("--tail", type=_positive_int, help="the last N records")
+    p_read.add_argument("--after-event", help="continue after this record (from a [more: …] hint)")
+    p_read.add_argument("--since", type=_since_bound)
+    p_read.add_argument("--until", type=_until_bound)
+    p_read.add_argument("--tools", choices=("brief", "none"), default="brief",
+                        help="brief: one line per tool call and result")
+    p_read.add_argument("--role", choices=("user", "assistant"),
+                        help="only this speaker's messages (no tool lines)")
+    p_read.add_argument("--full", action="store_true",
+                        help="with --line: that one record unabridged, tool output and hidden text included")
+    p_read.add_argument("--offset", type=int, default=0, help="character offset when continuing a --full record")
+    p_read.add_argument("--evidence", action="store_true",
+                        help="with --line: the record, the user request before it, and the reply after it")
+    p_read.add_argument("--show-hidden", action="store_true",
+                        help="include harness text, setup records, and duplicate copies")
+    p_read.add_argument("--max-bytes", type=_positive_int, default=READ_PAGE_BYTES)
     p_bundle = commands.add_parser("bundle-page")
     p_bundle.add_argument("--bundle", type=Path, required=True)
     p_bundle.add_argument("--case-id")
     p_bundle.add_argument("--continuation-id")
     p_bundle.add_argument("--snapshot-id")
     for name in ("provider", "project", "session", "role", "tool"):
-        p_bundle.add_argument("--" + name)
+        p_bundle.add_argument("--" + name, **({"type": TIME_BOUND_TYPES[name]} if name in TIME_BOUND_TYPES else {}))
     p_bundle.add_argument("--offset", type=int, default=0)
     p_bundle.add_argument("--limit", type=int, default=50)
+    p_bundle.add_argument("--until", type=_until_bound)
+    p_bundle.add_argument("--format", choices=("json", "text"), default="json")
     p_details = commands.add_parser("details")
+    p_details.add_argument("--until", type=_until_bound)
     p_details.add_argument("--snapshot-id", required=True)
     p_details.add_argument("--result-id", dest="result_ids", action="append", required=True)
     p_details.add_argument("--bundle", type=Path, help="result bundle used to resolve r1/r2 aliases")
@@ -8703,7 +9794,7 @@ def main(argv: list[str] | None = None) -> int:
     p_records = commands.add_parser("record-stream")
     p_records.add_argument("--output", type=Path, required=True)
     for name in ("provider", "project", "session", "role", "tool", "lineage", "since", "until", "category"):
-        p_records.add_argument("--" + name)
+        p_records.add_argument("--" + name, **({"type": TIME_BOUND_TYPES[name]} if name in TIME_BOUND_TYPES else {}))
     p_records.add_argument("--after-rowid", type=int, default=0)
     p_records.add_argument("--snapshot-id", help="required snapshot identity when resuming")
     p_records.add_argument(
@@ -8717,14 +9808,43 @@ def main(argv: list[str] | None = None) -> int:
         # Clean output already carries its page; the envelope request means "show all of it".
         args.include_page = True
     if args.command == "bundle-page":
-        json_print(result_bundle_page(args.bundle, args, args.db))
+        page = drop_after_until(result_bundle_page(args.bundle, args, args.db), args, "entries")
+        if getattr(args, "format", "json") == "text":
+            print(render_bundle_page_text(page, args))
+        else:
+            json_print(page)
         return 0
     if args.command == "search-index":
+        if args.format == "text" and args.mode == "ranked":
+            args.original_text, args.text = args.text, literal_query(args.text)
+        args.diversify = args.format == "text" and args.order == "relevance"
+        args.session_hits = {}
+        if args.until:
+            _TITLE_UNTIL.set(args.until)
         result = search_index_entrypoint(args.db, args)
-        json_print(bundle_if_oversized(args.db, result, args.bundle))
+        delivered = bundle_if_oversized(args.db, result, args.bundle)
+        widened = widened_query(args.text, delivered) if args.format == "text" else None
+        spent = (delivered.get("telemetry") or {}).get("total_seconds") or 0
+        if widened and args.deadline_seconds - spent > 1:
+            # The widened search shares the original search's time limit.
+            args.deadline_seconds -= spent
+            original, args.text = args.text, widened
+            result = search_index_entrypoint(args.db, args)
+            delivered = {**bundle_if_oversized(args.db, result, args.bundle), "widened_from": original}
+        if args.format == "text":
+            print(render_search_text(delivered, args.db, args))
+        else:
+            json_print(delivered)
+        return 0
+    if args.command == "read":
+        try:
+            print(read_session_text(args.db, args))
+        except ValueError as exc:
+            print(f"sessiondb read: {exc}", file=sys.stderr)
+            return 2
         return 0
     if args.command == "details":
-        json_print(details_entrypoint(args.db, args))
+        json_print(drop_after_until(details_entrypoint(args.db, args), args, "events"))
         return 0
     if args.command == "record-stream":
         db = connect(args.db, read_only=True)
