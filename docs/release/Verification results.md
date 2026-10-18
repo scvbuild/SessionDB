@@ -60,3 +60,10 @@ The version 1.0.0 wheel and source archive built on Python 3.9. The wheel instal
 A targeted publication scan covered all 44 reachable history blobs and both distribution archives. It found no author-specific home paths, private credentials path, repair launcher, or targeted private email references. The archives contain no database, object-store, or environment files. Synthetic secret fixtures remain in the tests; this scan is not a comprehensive secret-detection guarantee. The wheel contains ten files and the source archive contains 29 files.
 
 The earlier candidate results above remain historical evidence. Linux, Windows, public adoption, and OpenAI program acceptance remain unverified.
+
+## Version 1.0.1 release verification (18 October 2026)
+
+Version 1.0.1 fixes three problems in 1.0.0. Secret redaction now also covers keys written as quoted JSON (`"password": "x"`), credentials in any `scheme://user:pass@` address rather than only http and https, and secrets that follow an escaped line break or an earlier redacted key; the address check now runs in linear time on long unbroken text. A transcript line holding a lone UTF-16 surrogate (a half-cut emoji) is kept as an unreadable record instead of failing ingest for its whole file. Timestamps with fraction lengths other than 3 or 6 digits parse on Python 3.9.
+
+Six new tests cover these fixes; each fails on 1.0.0 and passes on 1.0.1. The suite ran 282 tests: 279 passed, two were skipped, and `test_installed_native_watcher_events_and_restart` failed identically on 1.0.0 in this environment, because it started a differently configured `sessiondb-freshness` already installed on the test machine. The wheel and source archive built on Python 3.9 with setuptools 82.0.1. The wheel contains the same ten files as 1.0.0 and the source archive 30 files, one more than 1.0.0 for the new test file. A targeted scan of the release changes and both archives found no author-specific home paths or private email references. Text indexed by 1.0.0 keeps its earlier redaction until the search index is rebuilt.
+
