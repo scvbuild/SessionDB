@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "local-sessiondb-public"
-version = "1.0.0"
+version = "1.0.1"
 description = "Local search and verifiable retrieval across Claude and Codex coding sessions"
 readme = "README.md"
 requires-python = ">=3.9"

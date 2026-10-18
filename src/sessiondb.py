@@ -172,17 +172,22 @@ ADAPTER_MIGRATIONS = {
 REDACTION_RULES = (
     ("assignment", re.compile(
         r"(api[_-]?key|key|token|secret|password|authorization)"
-        r"(\s*[:=]\s*)(\"[^\"]+\"|'[^']+'|[^\n,;]+)"
+        r"([\"']?\s*[:=]\s*)(\"[^\"]+\"|'[^']+'|[^\n,;]+)"
     )),
     ("bearer", re.compile(r"\b(bearer)(\s+)([a-z0-9._~+/=-]{8,})")),
     ("provider-key", re.compile(
-        r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{16,}|AKIA[A-Z0-9]{16})\b"
+        r"(?:\b|(?<=\\[nrt]))(?:gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{16,}|AKIA[A-Z0-9]{16})\b"
     )),
     ("pem", re.compile(
         r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
         re.DOTALL,
     )),
-    ("url-credentials", re.compile(r"(https?://)([^\s/@:]+):([^\s/@]+)@")),
+    # Capping each part keeps the scan linear; uncapped, long unbroken text (encoded data,
+    # minified files) took quadratic time. No word boundary: escaped text such as a literal
+    # "\nhttps://" glues a letter to the scheme.
+    ("url-credentials", re.compile(
+        r"([a-z][a-z0-9+.-]{0,31}://)([^\s/@:]{1,256}):([^\s/@]{1,2048})@"
+    )),
 )
 ASCII_LOWER_TABLE = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
 SECRET_FIELD_RE = re.compile(
@@ -676,6 +681,7 @@ def redact(text: str) -> str:
                 lowered = text.translate(ASCII_LOWER_TABLE)
         else:
             text = pattern.sub(f"[{name.upper()}_REDACTED]", text)
+            lowered = text.translate(ASCII_LOWER_TABLE)
     return BASE64_RE.sub("[BASE64_REDACTED]", text)
 
 
@@ -1086,11 +1092,20 @@ def flatten_raw_text(value: Any) -> str:
     return "\n".join(part for part in out if part)
 
 
+ISO_FRACTION = re.compile(r"(\d{2}:\d{2}:\d{2})\.(\d+)")
+
+
+def parse_iso_datetime(value: str) -> datetime:
+    """fromisoformat that also accepts Z and fractions other than 3 or 6 digits on Python 3.9."""
+    text = ISO_FRACTION.sub(lambda match: match.group(1) + "." + match.group(2)[:6].ljust(6, "0"), value, count=1)
+    return datetime.fromisoformat(text.replace("Z", "+00:00"))
+
+
 def normalize_timestamp(value: str | None) -> str | None:
     if not value:
         return None
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = parse_iso_datetime(value)
         if parsed.tzinfo is None:
             return None
         return parsed.astimezone(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
@@ -2139,6 +2154,8 @@ def store_source_lines(
             row = json.loads(raw_line)
             if not isinstance(row, dict):
                 raise ValueError("record is not an object")
+            # A lone UTF-16 surrogate escape parses but cannot be stored; raises UnicodeEncodeError.
+            raw = stored_json(row)
         except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
             raw_hash = digest(raw_line)
             event_id = digest(f"{source_id}:{line_number}:{raw_hash}".encode())
@@ -2162,7 +2179,6 @@ def store_source_lines(
             issues += 1
             count += 1
             continue
-        raw = stored_json(row)
         raw_hash = digest(raw)
         parsed = (
             parse_claude(row, path, meta, auto_extensions)
@@ -8205,7 +8221,7 @@ def _time_bound(value: str, *, end: bool) -> str:
             moment = datetime.fromisoformat(value).replace(tzinfo=timezone.utc)
             moment = moment + timedelta(days=1, microseconds=-1) if end else moment
         else:
-            moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            moment = parse_iso_datetime(value)
             moment = moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
     except ValueError:
         raise argparse.ArgumentTypeError(
