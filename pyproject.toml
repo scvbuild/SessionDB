@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "local-sessiondb-public"
-version = "1.0.1"
+version = "1.1.0"
 description = "Local search and verifiable retrieval across Claude and Codex coding sessions"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -21,8 +21,10 @@ sessiondb = "sessiondb:main"
 sessiondb-admin = "full_corpus:main"
 sessiondb-export = "snapshot_export:main"
 sessiondb-freshness = "freshness_service:main"
+sessiondb-repair = "repair_agent:main"
+sessiondb-cloud-sync = "full_corpus:cloud_sync_main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-py-modules = ["sessiondb", "full_corpus", "snapshot_export", "freshness_service"]
+py-modules = ["sessiondb", "full_corpus", "snapshot_export", "freshness_service", "cloud_fetch", "token_usage", "rebuild_copy", "repair_agent"]
 license-files = ["LICENSE"]

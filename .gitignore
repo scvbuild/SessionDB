@@ -10,3 +10,5 @@ dist/
 *.consumed.json
 demo-data/
 retrieval-results/
+
+.sessiondb-repair/

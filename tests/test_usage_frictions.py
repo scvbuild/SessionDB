@@ -8,10 +8,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import freshness_service
 import full_corpus
 import sessiondb
 
-ORDER = "e.order_timestamp,e.provider,e.session_id,e.source_id,e.line_number,e.event_id"
+ORDER = "e.order_timestamp,e.provider,e.session_id,src.source_id,e.line_number,e.event_id"
 
 
 def query_args(**changes):
@@ -74,7 +75,7 @@ class SessionSourcePrefilterTest(unittest.TestCase):
         """The pre-change scan: the event-level clause alone, in query order."""
         escaped = session.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         return [row[0] for row in self.db.execute(
-            "SELECT e.event_id FROM events e JOIN sources src USING(source_id) "
+            "SELECT lower(hex(e.event_id)) FROM events e JOIN sources src ON src.source_key=e.source_key "
             f"WHERE e.session_id LIKE ? ESCAPE '\\' ORDER BY {ORDER}", (f"%{escaped}%",),
         )]
 
@@ -86,7 +87,8 @@ class SessionSourcePrefilterTest(unittest.TestCase):
                 self.assertEqual([row["event_id"] for row in rows], expected)
                 clauses, values = sessiondb._index_filter_clauses(query_args(session=session))
                 indexed = [row[0] for row in self.db.execute(
-                    "SELECT e.event_id FROM events e WHERE " + " AND ".join(clauses)
+                    "SELECT lower(hex(e.event_id)) FROM events e "
+                    "JOIN sources src ON src.source_key=e.source_key WHERE " + " AND ".join(clauses)
                     + f" ORDER BY {ORDER}", values,
                 )]
                 self.assertEqual(indexed, expected)
@@ -153,12 +155,64 @@ class ReceiptAvailabilityTest(unittest.TestCase):
         value.update(changes)
         return value
 
+    def sync(self, report, during=None):
+        def fake_sync(*_args, **_kwargs):
+            if during is not None:
+                during()
+            return report
+        with mock.patch.object(freshness_service.full_corpus, "fast_sync", side_effect=fake_sync), \
+                mock.patch.object(
+                    freshness_service, "publish_status",
+                    side_effect=lambda value, *_args, **_kwargs: value,
+                ):
+            return freshness_service.run_sync(
+                self.db_path, self.state_dir, "test",
+            )
 
     def receipt_exists(self):
         return sessiondb.projection_integrity_receipt_path(self.db_path).exists()
 
+    def test_drift_only_sync_publishes_a_receipt(self):
+        result = self.sync(self.report(
+            complete=False, sources_drifted_after_sync=["/live/tail.jsonl"],
+        ))
+        self.assertEqual(result["projection_integrity_receipt"]["state"], "current")
+        self.assertIsNotNone(sessiondb.projection_status_from_receipt(self.db))
+        search = sessiondb.search_index(self.db, argparse.Namespace(
+            text="needle", mode="literal", provider=None, project=None, session=None,
+            role=None, tool=None, lineage=None, since=None, until=None,
+        ))
+        self.assertEqual(search["telemetry"]["coverage_verification"], "receipt")
 
+    def test_incomplete_syncs_still_withhold_and_remove_the_receipt(self):
+        published = self.sync(self.report())
+        self.assertEqual(published["projection_integrity_receipt"]["state"], "current")
+        self.assertIsNotNone(sessiondb.projection_status_from_receipt(self.db))
+        self.assertTrue(self.receipt_exists())
+        for label, changes in (
+            ("incomplete report", {"complete": False, "complete_except_drift": False}),
+            ("failed or missing sources", {"complete": False, "complete_except_drift": False,
+                                           "hard_failures": ["/broken.jsonl"]}),
+            ("failed migration", {"complete": False, "complete_except_drift": False,
+                                  "migrations": [{"state": "failed"}]}),
+            ("old report shape", {"complete": False, "complete_except_drift": None}),
+        ):
+            with self.subTest(label):
+                self.sync(self.report())
+                result = self.sync(self.report(**changes))
+                self.assertEqual(result["projection_integrity_receipt"]["state"], "withheld")
+                self.assertFalse(self.receipt_exists())
 
+    def test_previous_receipt_survives_sync_start_but_not_a_write(self):
+        self.sync(self.report())
+        seen = []
+        self.sync(self.report(), during=lambda: seen.append(
+            sessiondb.projection_status_from_receipt(self.db) is not None
+        ))
+        self.assertEqual(seen, [True])
+        self.ingest("second", "needle second evidence")
+        self.assertTrue(self.receipt_exists())
+        self.assertIsNone(sessiondb.projection_status_from_receipt(self.db))
 
 
 class CleanQueryPagingTest(unittest.TestCase):
@@ -252,18 +306,3 @@ class ReadableContinuationTest(unittest.TestCase):
             pages += 1
         self.assertGreater(pages, 2)
         self.assertEqual("".join(pieces), text)
-
-
-class VariableLaunchedAuditTest(unittest.TestCase):
-    CLI = "/Users/example/.local/bin/sessiondb"
-    DB = "/Users/example/.local/share/sessiondb/data/sessiondb.sqlite"
-
-
-
-
-
-
-
-
-if __name__ == "__main__":
-    unittest.main()

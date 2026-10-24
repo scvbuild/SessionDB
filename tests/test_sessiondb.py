@@ -1,9 +1,11 @@
 import argparse
 import base64
 import contextlib
+import fcntl
 import hashlib
 import io
 import json
+import queue
 import os
 import re
 import shutil
@@ -22,11 +24,38 @@ from unittest import mock
 import zstandard as zstd
 
 import full_corpus
+import freshness_service
 import sessiondb
 import snapshot_export
 
 
+# Event rows in the form the serving code reads them (hashes as hex, source identity joined).
+EVENT_ROWS = f"SELECT {sessiondb.EVENT_COLUMNS},src.path AS source_path FROM {sessiondb.EVENT_JOIN}"
+
+
 class SessionDBTest(unittest.TestCase):
+    def _line(self, session, text, role="user"):
+        return json.dumps({"type": role, "sessionId": session, "message": {"content": text}}) + "\n"
+
+
+    @contextlib.contextmanager
+    def _roots(self, *roots):
+        old_roots = full_corpus.ROOTS
+        full_corpus.ROOTS = {"claude": roots}
+        try:
+            yield
+        finally:
+            full_corpus.ROOTS = old_roots
+
+
+    def _contents(self, db_path, session):
+        connection = sessiondb.connect(db_path)
+        try:
+            return [item["content"] for item in sessiondb.reconstruct(connection, "claude", session)]
+        finally:
+            connection.close()
+
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -57,8 +86,8 @@ class SessionDBTest(unittest.TestCase):
         sessiondb.ingest(self.db, "claude", source)
         self.db.commit()
         rows = self.db.execute(
-            "SELECT s.path,e.line_number,e.raw_hash FROM events e "
-            "JOIN sources s ON s.source_id=e.source_id WHERE s.path=? ORDER BY e.line_number",
+            "SELECT s.path,e.line_number,lower(hex(e.raw_hash)) AS raw_hash FROM events e "
+            "JOIN sources s ON s.source_key=e.source_key WHERE s.path=? ORDER BY e.line_number",
             (str(source.resolve()),),
         ).fetchall()
         request, answer = ({"path": row["path"], "line": row["line_number"],
@@ -97,6 +126,10 @@ class SessionDBTest(unittest.TestCase):
 
 
 
+
+
+
+
     def test_cross_provider_dedup_reconstruction_search_and_idempotency(self):
         shared = "standing instruction alpha"
         claude = self.write("claude.jsonl", [
@@ -115,7 +148,7 @@ class SessionDBTest(unittest.TestCase):
         self.assertEqual(first["events"], 3)
         self.assertEqual(second["status"], "unchanged")
         shared_hash = sessiondb.digest(sessiondb.canonical(shared))
-        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM objects WHERE object_hash=?", (shared_hash,)).fetchone()[0], 1)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM objects WHERE object_hash=unhex(?)", (shared_hash,)).fetchone()[0], 1)
         expanded = sessiondb.reconstruct(self.db, "claude", "c1")
         self.assertEqual([item["content"] for item in expanded[:2]], [shared, [{"type": "text", "text": "answer"}]])
         args = argparse.Namespace(text="standing", provider=None, project=None, session=None, role=None, tool=None, lineage=None, since=None, until=None, raw=False, limit=50)
@@ -158,7 +191,7 @@ class SessionDBTest(unittest.TestCase):
             {"type": "user", "sessionId": "ordered", "message": {"role": "user", "content": content}},
         ])
         sessiondb.ingest(self.db, "claude", source)
-        row = self.db.execute("SELECT * FROM events").fetchone()
+        row = self.db.execute(EVENT_ROWS).fetchone()
         self.assertEqual(list(sessiondb.read_event_content(self.db, row)[0]), ["id", "type", "content"])
         args = argparse.Namespace(
             text="toolu_123 tool_result ordered payload", provider=None, project=None,
@@ -284,7 +317,7 @@ class SessionDBTest(unittest.TestCase):
             [("session_meta", 1, None), ("token_usage_record", 1, None), ("token_count", 1, None)],
         )
         event = self.db.execute(
-            "SELECT * FROM events WHERE category='token_usage_record'"
+            EVENT_ROWS + " WHERE e.category='token_usage_record'"
         ).fetchone()
         self.assertEqual(sessiondb.read_event_structure(self.db, event), usage)
         args = argparse.Namespace(
@@ -321,7 +354,7 @@ class SessionDBTest(unittest.TestCase):
         }
         source = self.write("codex-token-usage-drift.jsonl", [row])
         self.assertEqual(sessiondb.ingest(self.db, "codex", source)["issues"], 1)
-        event = self.db.execute("SELECT * FROM events").fetchone()
+        event = self.db.execute(EVENT_ROWS).fetchone()
         self.assertEqual(event["supported"], 0)
         self.assertEqual(sessiondb.read_event_structure(self.db, event), row)
 
@@ -341,7 +374,7 @@ class SessionDBTest(unittest.TestCase):
             with self.subTest(name):
                 source = self.write(name, [case])
                 self.assertEqual(sessiondb.ingest(self.db, "codex", source)["issues"], 0)
-                event = self.db.execute("SELECT * FROM events ORDER BY rowid DESC LIMIT 1").fetchone()
+                event = self.db.execute(EVENT_ROWS + " ORDER BY e.event_rowid DESC LIMIT 1").fetchone()
                 self.assertEqual(
                     (event["category"], event["supported"], event["content_hash"]),
                     ("compaction", 1, None),
@@ -386,7 +419,7 @@ class SessionDBTest(unittest.TestCase):
         }
         source = self.write("codex-compaction-drift.jsonl", [row])
         self.assertEqual(sessiondb.ingest(self.db, "codex", source)["issues"], 1)
-        event = self.db.execute("SELECT * FROM events").fetchone()
+        event = self.db.execute(EVENT_ROWS).fetchone()
         self.assertEqual(event["supported"], 0)
         self.assertEqual(sessiondb.read_event_structure(self.db, event), row)
 
@@ -448,17 +481,18 @@ class SessionDBTest(unittest.TestCase):
         try:
             self.assertEqual(
                 {row[0] for row in db.execute("SELECT adapter_version FROM sources")},
-                {"codex-v10"},
+                {sessiondb.ADAPTER_VERSION["codex"]},
             )
             self.assertEqual(db.execute(
                 "SELECT COUNT(*) FROM events WHERE supported=0"
             ).fetchone()[0], 0)
             event = db.execute(
-                "SELECT * FROM events WHERE category='compaction'"
+                EVENT_ROWS + " WHERE e.category='compaction'"
             ).fetchone()
             self.assertEqual(sessiondb.read_event_structure(db, event), compaction)
         finally:
             db.close()
+
 
     def test_codex_realtime_items_preserve_text_metadata_and_unknown_control(self):
         rows = [
@@ -481,7 +515,7 @@ class SessionDBTest(unittest.TestCase):
         source = self.write("codex-realtime-items.jsonl", rows)
         self.assertEqual(sessiondb.ingest(self.db, "codex", source)["issues"], 1)
         events = self.db.execute(
-            "SELECT * FROM events WHERE category IN "
+            EVENT_ROWS + " WHERE e.category IN "
             "('transcript_segment','bem_item_promoted','realtime_session_closed','future_realtime_item') "
             "ORDER BY line_number"
         ).fetchall()
@@ -554,13 +588,13 @@ class SessionDBTest(unittest.TestCase):
         try:
             self.assertEqual(
                 {row[0] for row in db.execute("SELECT adapter_version FROM sources")},
-                {"codex-v10"},
+                {sessiondb.ADAPTER_VERSION["codex"]},
             )
             self.assertEqual(db.execute(
                 "SELECT COUNT(*) FROM events WHERE supported=0"
             ).fetchone()[0], 0)
             event = db.execute(
-                "SELECT * FROM events WHERE category='transcript_segment'"
+                EVENT_ROWS + " WHERE e.category='transcript_segment'"
             ).fetchone()
             self.assertEqual(sessiondb.read_event_structure(db, event)["payload"]["text"],
                              "migrated realtime text")
@@ -914,6 +948,122 @@ class SessionDBTest(unittest.TestCase):
         self.assertEqual(event["supported"], 0)
         self.assertIn("unknown Claude row type", event["issue"])
 
+    def test_claude_api_request_family_preserves_search_and_redacts_control(self):
+        rows = [
+            {
+                "type": "api-request", "sessionId": "api-family", "id": "request-1",
+                "timestamp": "2026-10-20T10:26:24.868Z", "version": "2.1.304",
+                "querySource": "sdk", "shapeHash": "shape-1",
+                "params": {
+                    "model": "claude-sonnet-5-5", "betas": ["inline-tools-2026-09-15"],
+                    "max_tokens": 128000, "thinking": {"type": "adaptive", "display": "omitted"},
+                    "output_config": {"effort": "medium"}, "api_key": "sk-request-secret-123456",
+                },
+            },
+            {
+                "type": "api-request-blob", "sessionId": "api-family", "hash": "blob-1",
+                "message": {"role": "user", "content": [{
+                    "type": "text", "text": "searchable blob api_key=sk-blob-secret-123456",
+                }]},
+            },
+            {
+                "type": "api-request-shape", "sessionId": "api-family", "shapeHash": "shape-1",
+                "timestamp": "2026-10-20T10:26:24.868Z", "version": "2.1.304",
+                "shape": {"system": [{"type": "text", "text": "searchable shape phrase"}], "tools": []},
+            },
+            {
+                "type": "api-request-future", "sessionId": "api-family",
+                "message": {"content": "must remain unsupported"},
+            },
+        ]
+        source = self.write("claude-api-request-family.jsonl", rows)
+        result = sessiondb.ingest(self.db, "claude", source)
+        self.assertEqual(result["issues"], 1)
+        events = self.db.execute(EVENT_ROWS + " ORDER BY e.line_number").fetchall()
+        self.assertEqual(
+            [(event["category"], event["supported"], event["content_hash"] is not None) for event in events],
+            [("api-request", 1, False), ("api-request-blob", 1, True),
+             ("api-request-shape", 1, False), ("api-request-future", 0, True)],
+        )
+        for event, row in zip(events, rows):
+            self.assertEqual(sessiondb.read_event_structure(self.db, event), row)
+        args = argparse.Namespace(
+            text="searchable blob", provider="claude", project=None, session="api-family",
+            role=None, tool=None, lineage=None, since=None, until=None, raw=False,
+            limit=10, offset=0, before=0, after=0,
+        )
+        self.assertEqual(len(sessiondb.query(self.db, args)), 1)
+        args.text = "searchable shape phrase"
+        self.assertEqual(len(sessiondb.query(self.db, args)), 1)
+        args.text = "sk-blob-secret-123456"
+        self.assertEqual(sessiondb.query(self.db, args), [])
+        self.assertEqual(
+            [item["content"] for item in sessiondb.reconstruct(self.db, "claude", "api-family", raw=True)],
+            rows,
+        )
+
+    def test_claude_api_request_migration_rereads_only_affected_sources(self):
+        transcripts = self.root / "claude-api-request-migration"
+        transcripts.mkdir()
+        affected_rows = [
+            {"type": "api-request", "sessionId": "api-migration", "params": {"model": "claude-sonnet-5-5"}},
+            {"type": "api-request-blob", "sessionId": "api-migration",
+             "message": {"role": "user", "content": "migrated api blob"}},
+            {"type": "api-request-shape", "sessionId": "api-migration",
+             "shape": {"system": [{"type": "text", "text": "migrated api shape"}]}},
+        ]
+        affected = transcripts / "affected.jsonl"
+        unaffected = transcripts / "unaffected.jsonl"
+        affected.write_text("".join(json.dumps(row) + "\n" for row in affected_rows), encoding="utf-8")
+        unaffected.write_text(json.dumps({
+            "type": "user", "sessionId": "api-unaffected", "message": {"content": "control"},
+        }) + "\n", encoding="utf-8")
+        db_path = self.root / "claude-api-request-migration.sqlite"
+        db = sessiondb.connect(db_path)
+        sessiondb.ingest(db, "claude", affected)
+        sessiondb.ingest(db, "claude", unaffected)
+        db.execute("UPDATE sources SET adapter_version='claude-v7'")
+        db.execute(
+            "UPDATE events SET supported=0,issue='unknown Claude row type: api-request' "
+            "WHERE category IN ('api-request','api-request-blob','api-request-shape')"
+        )
+        db.execute("UPDATE sources SET issue_count=3 WHERE path=?", (str(affected.resolve()),))
+        db.commit()
+        db.close()
+        old_roots = full_corpus.ROOTS
+        reads = []
+        stable_snapshot = sessiondb.stable_source_snapshot
+
+        def track_read(path, *args, **kwargs):
+            reads.append(Path(path).name)
+            return stable_snapshot(path, *args, **kwargs)
+
+        try:
+            full_corpus.ROOTS = {"claude": (transcripts,)}
+            with mock.patch.object(sessiondb, "stable_source_snapshot", side_effect=track_read), \
+                    mock.patch.dict(sessiondb.ADAPTER_VERSION, {"claude": "claude-v8"}):
+                report = full_corpus.fast_sync(db_path, self.root / "claude-api-request-migration.json")
+        finally:
+            full_corpus.ROOTS = old_roots
+        self.assertTrue(report["complete"])
+        self.assertEqual(reads, ["affected.jsonl"])
+        self.assertEqual(report["migrations"][0]["selection"], "unsupported-only")
+        db = sessiondb.connect(db_path)
+        try:
+            self.assertEqual(
+                {row[0] for row in db.execute("SELECT adapter_version FROM sources")}, {"claude-v8"},
+            )
+            self.assertEqual(db.execute(
+                "SELECT COUNT(*) FROM events WHERE supported=0"
+            ).fetchone()[0], 0)
+            self.assertEqual(
+                [item["content"] for item in sessiondb.reconstruct(
+                    db, "claude", "api-migration", raw=True,
+                )], affected_rows,
+            )
+        finally:
+            db.close()
+
     def test_passive_codex_completed_item_is_auto_admitted_and_revalidated(self):
         source = self.write("image-view-completed.jsonl", [{
             "type": "event_msg", "payload": {
@@ -984,13 +1134,15 @@ class SessionDBTest(unittest.TestCase):
         path = self.root / "broken.jsonl"
         path.write_text("not-json\n", encoding="utf-8")
         sessiondb.ingest(self.db, "claude", path)
-        row = self.db.execute("SELECT * FROM events").fetchone()
+        row = self.db.execute(EVENT_ROWS).fetchone()
         path.unlink()
         with sessiondb.forbid_source_transcript_reads() as telemetry:
             self.assertEqual(sessiondb.read_raw_event(self.db, row), "not-json\n")
         self.assertEqual(telemetry["attempts"], 0)
         self.assertEqual(telemetry["sources"], [])
         self.assertFalse(sessiondb.source_read_audit_path(self.db).exists())
+
+
 
     def test_embedded_global_instructions_are_factored_once(self):
         instructions = "# Global Instructions\n\n## Behavior rules\n- Keep exact evidence."
@@ -1002,10 +1154,10 @@ class SessionDBTest(unittest.TestCase):
         ])
         sessiondb.ingest(self.db, "claude", source)
         expected_hash = sessiondb.digest(sessiondb.canonical(instructions))
-        row = self.db.execute("SELECT kind,compression FROM objects WHERE object_hash=?", (expected_hash,)).fetchone()
+        row = self.db.execute("SELECT kind,compression FROM objects WHERE object_hash=unhex(?)", (expected_hash,)).fetchone()
         self.assertEqual(tuple(row), ("known-instruction", "zstd"))
         self.assertEqual(
-            self.db.execute("SELECT COUNT(*) FROM object_references WHERE child_hash=?", (expected_hash,)).fetchone()[0],
+            self.db.execute("SELECT COUNT(*) FROM object_references WHERE child_hash=unhex(?)", (expected_hash,)).fetchone()[0],
             2,
         )
         self.assertEqual(
@@ -1035,7 +1187,7 @@ class SessionDBTest(unittest.TestCase):
         rendered = json.dumps(clean)
         self.assertIn("[REDACTED]", rendered)
         self.assertNotIn("topsecret", rendered)
-        stored_hash = self.db.execute("SELECT object_hash FROM event_content").fetchone()[0]
+        stored_hash = self.db.execute("SELECT lower(hex(object_hash)) FROM event_content").fetchone()[0]
         args.include_hashes = True
         clean_with_hashes = sessiondb.query_clean(self.db, args)
         self.assertIn(stored_hash, clean_with_hashes["object_hashes"])
@@ -1290,11 +1442,11 @@ class SessionDBTest(unittest.TestCase):
         description_hash = sessiondb.digest(sessiondb.canonical(shared_description))
         rules_hash = sessiondb.digest(sessiondb.canonical(project_rules))
         self.assertEqual(
-            self.db.execute("SELECT COUNT(*) FROM object_references WHERE child_hash=?", (description_hash,)).fetchone()[0],
+            self.db.execute("SELECT COUNT(*) FROM object_references WHERE child_hash=unhex(?)", (description_hash,)).fetchone()[0],
             2,
         )
         self.assertEqual(
-            self.db.execute("SELECT COUNT(*) FROM object_references WHERE child_hash=? AND purpose='tagged-block'", (rules_hash,)).fetchone()[0],
+            self.db.execute("SELECT COUNT(*) FROM object_references WHERE child_hash=unhex(?) AND purpose='tagged-block'", (rules_hash,)).fetchone()[0],
             2,
         )
         self.assertEqual(sessiondb.reconstruct(self.db, "claude", "shared-values")[0]["content"], contents)
@@ -1311,7 +1463,7 @@ class SessionDBTest(unittest.TestCase):
         source = self.write("structure.jsonl", [row])
         result = sessiondb.ingest(self.db, "codex", source)
         self.assertEqual(result["issues"], 0)
-        event = self.db.execute("SELECT * FROM events").fetchone()
+        event = self.db.execute(EVENT_ROWS).fetchone()
         bundle = self.db.execute("SELECT structure_zstd FROM sources").fetchone()[0]
         self.assertNotIn(b"large argument", bundle)
         self.assertEqual(sessiondb.read_event_structure(self.db, event), row)
@@ -1328,6 +1480,7 @@ class SessionDBTest(unittest.TestCase):
         ])
         self.assertEqual(sessiondb.ingest(self.db, "claude", claude)["issues"], 0)
         self.assertEqual(sessiondb.ingest(self.db, "codex", codex)["issues"], 0)
+
 
     def test_bridge_session_and_cost_state_metadata_are_supported_and_contentless(self):
         rows = [
@@ -1359,7 +1512,7 @@ class SessionDBTest(unittest.TestCase):
                 source = self.write(f"{row['type']}.jsonl", [row])
                 result = sessiondb.ingest(self.db, "claude", source)
                 self.assertEqual(result["issues"], 0)
-                event = self.db.execute("SELECT * FROM events ORDER BY rowid DESC LIMIT 1").fetchone()
+                event = self.db.execute(EVENT_ROWS + " ORDER BY e.event_rowid DESC LIMIT 1").fetchone()
                 self.assertEqual(event["category"], row["type"])
                 self.assertEqual(event["supported"], 1)
                 self.assertIsNone(event["content_hash"])
@@ -1389,7 +1542,7 @@ class SessionDBTest(unittest.TestCase):
         source = self.write("worktree-lifecycle.jsonl", rows)
         result = sessiondb.ingest(self.db, "claude", source)
         self.assertEqual(result["issues"], 0)
-        events = self.db.execute("SELECT * FROM events ORDER BY line_number").fetchall()
+        events = self.db.execute(EVENT_ROWS + " ORDER BY e.line_number").fetchall()
         self.assertEqual([event["category"] for event in events], ["relocated", "worktree-state"])
         self.assertEqual([event["supported"] for event in events], [1, 1])
         self.assertEqual([sessiondb.read_event_structure(self.db, event) for event in events], rows)
@@ -1406,7 +1559,7 @@ class SessionDBTest(unittest.TestCase):
         source = self.write("atis-latch.jsonl", rows)
         result = sessiondb.ingest(self.db, "claude", source)
         self.assertEqual(result["issues"], 0)
-        events = self.db.execute("SELECT * FROM events ORDER BY line_number").fetchall()
+        events = self.db.execute(EVENT_ROWS + " ORDER BY e.line_number").fetchall()
         self.assertEqual([event["supported"] for event in events], [1, 1])
         self.assertEqual([event["content_hash"] for event in events], [None, None])
         self.assertEqual([sessiondb.read_event_structure(self.db, event) for event in events], rows)
@@ -1434,6 +1587,172 @@ class SessionDBTest(unittest.TestCase):
 
 
 
+
+
+    def test_sync_window_spaces_event_syncs_but_yields_to_stop_and_rescan(self):
+        def run(trigger=None):
+            changed, stopping = threading.Event(), threading.Event()
+            recovery_events = freshness_service.queue.SimpleQueue()
+            if trigger == "stop":
+                threading.Timer(0.1, lambda: (stopping.set(), changed.set())).start()
+            elif trigger == "rescan":
+                threading.Timer(0.1, lambda: (
+                    recovery_events.put({"events": 1}), changed.set(),
+                )).start()
+            elif trigger == "writes":
+                for delay in (0.1, 0.2, 0.3):
+                    threading.Timer(delay, changed.set).start()
+            started = time.monotonic()
+            freshness_service.wait_for_sync_window(
+                changed, stopping, recovery_events,
+                not_before=started + 0.6, debounce=0.05, max_debounce=0.2,
+            )
+            return time.monotonic() - started
+
+        self.assertGreaterEqual(run("writes"), 0.6)
+        self.assertLess(run("stop"), 0.4)
+        self.assertLess(run("rescan"), 0.4)
+
+
+
+
+    def test_watcher_append_extends_cached_hash_without_rereading_prefix(self):
+        transcripts = self.root / "cached"
+        transcripts.mkdir()
+        source = transcripts / "cached.jsonl"
+        source.write_text(self._line("cached", "first"))
+        db_path = self.root / "cached.sqlite"
+        with self._roots(transcripts):
+            full_corpus.fast_sync(db_path, self.root / "cached-one.json")
+            with source.open("a") as handle:
+                handle.write(self._line("cached", "second", "assistant"))
+            with mock.patch.object(
+                sessiondb, "stable_source_snapshot", side_effect=AssertionError("full reread"),
+            ):
+                second = full_corpus.fast_sync(db_path, self.root / "cached-two.json")
+        self.assertEqual(second["status_counts"], {"appended": 1})
+        self.assertEqual(self._contents(db_path, "cached"), ["first", "second"])
+        connection = sessiondb.connect(db_path)
+        try:
+            stored = connection.execute("SELECT source_hash FROM sources").fetchone()[0]
+        finally:
+            connection.close()
+        self.assertEqual(stored, hashlib.sha256(source.read_bytes()).hexdigest())
+
+
+
+    def test_incremental_receipt_matches_deep_check_and_falls_back_on_other_writes(self):
+        transcripts = self.root / "incremental"
+        transcripts.mkdir()
+        source = transcripts / "incremental.jsonl"
+        source.write_text(self._line("incremental", "first"))
+        db_path = self.root / "incremental.sqlite"
+        state_dir = self.root / "freshness"
+
+        def sync(**kwargs):
+            return freshness_service.run_sync(
+                db_path, state_dir, "test", **kwargs,
+            )["projection_integrity_receipt"]
+
+        def append(text):
+            with source.open("a") as handle:
+                handle.write(self._line("incremental", text, "assistant"))
+
+        with self._roots(transcripts):
+            self.assertEqual(sync()["verification"], "full")
+            append("second")
+            self.assertEqual(sync(changed_paths=[str(source)])["verification"], "since_previous_receipt")
+            receipt = json.loads(sessiondb.projection_integrity_receipt_path(db_path).read_text())
+            connection = sessiondb.connect(db_path, read_only=True)
+            try:
+                deep = sessiondb.projection_status(connection, pack_available=True, deep=True)
+                max_rowid = connection.execute("SELECT MAX(event_rowid) FROM events").fetchone()[0]
+                self.assertIsNotNone(sessiondb.projection_status_from_receipt(connection))
+            finally:
+                connection.close()
+            self.assertTrue(deep["complete"])
+            self.assertEqual(
+                (receipt["event_count"], receipt["projection_count"], receipt["passage_count"]),
+                (deep["events"], deep["projections"], deep["passages"]),
+            )
+            self.assertEqual(receipt["max_event_rowid"], max_rowid)
+
+            # Another connection committing during the sync forces the full check.
+            original_ingest = sessiondb.ingest
+
+            def ingest_with_foreign_commit(*args, **kwargs):
+                other = sqlite3.connect(db_path)
+                other.execute("INSERT OR REPLACE INTO metadata(key,value) VALUES('test_foreign','1')")
+                other.commit()
+                other.close()
+                return original_ingest(*args, **kwargs)
+
+            append("third")
+            with mock.patch.object(sessiondb, "ingest", ingest_with_foreign_commit):
+                self.assertEqual(sync(changed_paths=[str(source)])["verification"], "full")
+
+            # A rewrite deletes rows, so it forces the full check too.
+            source.write_text(self._line("incremental", "rewritten"))
+            self.assertEqual(sync(changed_paths=[str(source)])["verification"], "full")
+            append("after rewrite")
+            self.assertEqual(sync(changed_paths=[str(source)])["verification"], "since_previous_receipt")
+
+    def test_changed_paths_sync_reads_only_reported_files_and_falls_back_when_unfinished(self):
+        transcripts = self.root / "changed"
+        transcripts.mkdir()
+        first, second = transcripts / "first.jsonl", transcripts / "second.jsonl"
+        first.write_text(self._line("first", "one"))
+        second.write_text(self._line("second", "one"))
+        db_path = self.root / "changed.sqlite"
+        with self._roots(transcripts):
+            full_corpus.fast_sync(db_path, self.root / "changed-one.json")
+            for path in (first, second):
+                with path.open("a") as handle:
+                    handle.write(self._line(path.stem, "two", "assistant"))
+            partial = full_corpus.fast_sync(
+                db_path, self.root / "changed-two.json", changed_paths=[str(first)],
+            )
+            self.assertEqual(partial["discovery"], "changed_paths")
+            self.assertEqual(partial["status_counts"], {"appended": 1})
+            self.assertEqual(self._contents(db_path, "second"), ["one"])
+            connection = sessiondb.connect(db_path)
+            connection.execute("UPDATE sources SET status='ingesting' WHERE path=?", (str(second.resolve()),))
+            connection.commit()
+            connection.close()
+            fallback = full_corpus.fast_sync(
+                db_path, self.root / "changed-three.json", changed_paths=[str(first)],
+            )
+        self.assertEqual(fallback["discovery"], "full")
+        self.assertEqual(self._contents(db_path, "second"), ["one", "two"])
+
+    def test_changed_paths_sync_relocates_a_reported_move(self):
+        active, archived = self.root / "move-active", self.root / "move-archived"
+        active.mkdir()
+        archived.mkdir()
+        source = active / "moved.jsonl"
+        source.write_text(self._line("moved", "first"))
+        db_path = self.root / "moved.sqlite"
+        with self._roots(active, archived):
+            full_corpus.fast_sync(db_path, self.root / "moved-one.json")
+            moved = archived / source.name
+            source.rename(moved)
+            with moved.open("a") as handle:
+                handle.write(self._line("moved", "second", "assistant"))
+            result = full_corpus.fast_sync(
+                db_path, self.root / "moved-two.json", changed_paths=[str(source), str(moved)],
+            )
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["relocated_sources"][0]["to"], str(moved.resolve()))
+
+    def test_changed_paths_queue_requires_full_listing_until_first_take_and_after_folder_events(self):
+        pending = freshness_service.ChangedPaths()
+        self.assertIsNone(pending.take())
+        pending.add(["/a.jsonl", "", "/b.jsonl"])
+        self.assertEqual(pending.take(), ["/a.jsonl", "/b.jsonl"])
+        self.assertEqual(pending.take(), [])
+        pending.add(["/a.jsonl"])
+        pending.require_full()
+        self.assertIsNone(pending.take())
 
 
 
@@ -1493,146 +1812,17 @@ class SessionDBTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, f"schema version: {version}"):
                     sessiondb.connect(path)
 
-    def test_schema_v9_projection_storage_migrates_without_rebuilding_pack(self):
-        source = self.write("v9-migration.jsonl", [{
-            "type": "user", "sessionId": "v9-migration",
-            "message": {"role": "user", "content": "khách hàng proposal"},
-        }])
-        sessiondb.ingest(self.db, "claude", source)
-        pack = sessiondb.projection_pack_path(self.db)
-        pack_identity = (pack.name, pack.stat().st_size, sessiondb.digest(pack.read_bytes()))
-        fts_rowids = [row[0] for row in self.db.execute(
-            "SELECT rowid FROM positional_projection_fts ORDER BY rowid"
-        )]
-        self.db.execute("PRAGMA foreign_keys=OFF")
-        self.db.executescript("""
-            CREATE TABLE search_projection_blocks_v9 (
-              block_id TEXT PRIMARY KEY,pack_offset INTEGER NOT NULL,
-              compressed_bytes INTEGER NOT NULL,raw_bytes INTEGER NOT NULL,
-              block_hash TEXT NOT NULL
-            ) WITHOUT ROWID;
-            INSERT INTO search_projection_blocks_v9
-              SELECT hex(block_digest),pack_offset,compressed_bytes,raw_bytes,
-                     hex(block_digest)
-              FROM search_projection_blocks;
-            CREATE TABLE search_projection_refs_v9 (
-              event_rowid INTEGER PRIMARY KEY,block_id TEXT NOT NULL,
-              projection_offset INTEGER NOT NULL,projection_bytes INTEGER NOT NULL,
-              projection_hash TEXT NOT NULL
-            ) WITHOUT ROWID;
-            INSERT INTO search_projection_refs_v9
-              SELECT r.event_rowid,hex(b.block_digest),r.projection_offset,r.projection_bytes,
-                     hex(r.projection_hash)
-              FROM search_projection_refs r JOIN search_projection_blocks b USING(block_key);
-            DROP TABLE search_projection_refs;
-            DROP TABLE search_projection_blocks;
-            ALTER TABLE search_projection_blocks_v9 RENAME TO search_projection_blocks;
-            ALTER TABLE search_projection_refs_v9 RENAME TO search_projection_refs;
-            UPDATE metadata SET value='9' WHERE key='schema_version';
-        """)
-        self.db.commit()
-        self.db.close()
-        with self.assertRaisesRegex(ValueError, "writer migration"):
-            sessiondb.connect(self.db_path, read_only=True)
-        self.db = sessiondb.connect(self.db_path)
-        sessiondb.migrate_projection_storage_v9_to_v10(self.db)
-        self.assertEqual(
-            self.db.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()[0],
-            "10",
-        )
-        self.assertEqual(
-            self.db.execute("SELECT typeof(block_digest) FROM search_projection_blocks").fetchone()[0],
-            "blob",
-        )
-        self.assertEqual(
-            self.db.execute("SELECT typeof(reference_hash) FROM search_projection_refs").fetchone()[0],
-            "blob",
-        )
-        pack_report = sessiondb.verify_projection_pack(self.db)
-        self.assertTrue(pack_report["pass"], pack_report)
-        self.assertEqual(
-            [row[0] for row in self.db.execute(
-                "SELECT rowid FROM positional_projection_fts ORDER BY rowid"
-            )],
-            fts_rowids,
-        )
-        result = sessiondb.search_index(
-            self.db, self._search_args(text="khách hàng", mode="literal"),
-        )
-        self.assertEqual(result["total"], 1)
-        self.assertEqual(
-            (pack.name, pack.stat().st_size, sessiondb.digest(pack.read_bytes())), pack_identity,
-        )
-        source.write_text(json.dumps({
-            "type": "user", "sessionId": "v9-migration",
-            "message": {"role": "user", "content": "khách hàng updated proposal"},
-        }) + "\n", encoding="utf-8")
-        sessiondb.ingest(self.db, "claude", source)
-        updated = sessiondb.search_index(
-            self.db, self._search_args(text="updated proposal", mode="literal"),
-        )
-        self.assertEqual(updated["total"], 1)
 
-    def test_schema_v9_without_projection_tables_can_initialize_v10(self):
-        path = self.root / "v9-no-projection.sqlite"
-        old = sqlite3.connect(path)
-        old.execute("CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
-        old.execute("INSERT INTO metadata VALUES('schema_version','9')")
-        old.commit()
-        old.close()
-        migrated = sessiondb.connect(path)
-        try:
-            self.assertEqual(
-                migrated.execute(
-                    "SELECT value FROM metadata WHERE key='schema_version'"
-                ).fetchone()[0],
-                "10",
-            )
-            self.assertTrue(migrated.execute(
-                "SELECT 1 FROM sqlite_master WHERE name='search_projection_refs'"
-            ).fetchone())
-        finally:
-            migrated.close()
 
-    def test_schema_v9_projection_migration_rolls_back_on_invalid_digest(self):
-        path = self.root / "v9-invalid.sqlite"
-        old = sqlite3.connect(path)
-        old.executescript("""
-            CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-            INSERT INTO metadata VALUES('schema_version','9');
-            CREATE TABLE search_projection_blocks (
-              block_id TEXT PRIMARY KEY,pack_offset INTEGER NOT NULL,
-              compressed_bytes INTEGER NOT NULL,raw_bytes INTEGER NOT NULL,
-              block_hash TEXT NOT NULL,compressed_hash TEXT
-            ) WITHOUT ROWID;
-            CREATE TABLE search_projection_refs (
-              event_rowid INTEGER PRIMARY KEY,block_id TEXT NOT NULL,
-              projection_offset INTEGER NOT NULL,projection_bytes INTEGER NOT NULL,
-              projection_hash TEXT NOT NULL,reference_hash TEXT
-            ) WITHOUT ROWID;
-            INSERT INTO search_projection_blocks VALUES('00',0,0,0,'00',
-              '0000000000000000000000000000000000000000000000000000000000000000');
-        """)
-        old.commit()
-        old.close()
-        with self.assertRaises((sqlite3.OperationalError, ValueError)):
-            sessiondb.connect(path)
-        unchanged = sqlite3.connect(path)
-        try:
-            self.assertEqual(
-                unchanged.execute(
-                    "SELECT value FROM metadata WHERE key='schema_version'"
-                ).fetchone()[0],
-                "9",
-            )
-            self.assertIn(
-                "block_id",
-                {row[1] for row in unchanged.execute(
-                    "PRAGMA table_info(search_projection_blocks)"
-                )},
-            )
-        finally:
-            unchanged.close()
+
+
+
+
+
+
+
+
+
 
     def test_v9_redaction_rule_table_catches_real_secret_classes(self):
         secrets = [
@@ -1650,6 +1840,12 @@ class SessionDBTest(unittest.TestCase):
         self.assertNotIn("horse battery staple", sessiondb.redact("password: correct horse battery staple"))
         self.assertEqual(sessiondb.redact("public token count: 12"), "public token count: 12")
         self.assertEqual(sessiondb.redact("sk-short"), "sk-short")
+        self.assertNotIn("hunter2", sessiondb.redact('{"password": "hunter2"}'))
+        self.assertNotIn("hunter2", sessiondb.redact("{'api_key': 'hunter2'}"))
+        self.assertNotIn("hunter2", sessiondb.redact("postgres://alice:hunter2@db.example.test/app"))
+
+
+
 
     def test_secret_containers_are_redacted_from_clean_output_and_fts(self):
         source = self.write("nested-secret.jsonl", [
@@ -1982,8 +2178,9 @@ class SessionDBTest(unittest.TestCase):
         result = full_corpus.compact_copy(self.db_path, target)
         self.assertTrue(result["complete"])
         self.assertEqual(result["foreign_key_failures"], [])
-        self.assertEqual(result["freelist_bytes"], 0)
-        self.assertEqual(result["report"]["pack_verification"]["orphan_bytes"], 0)
+        self.assertEqual(result["freelist_pages"], 0)
+        self.assertEqual(result["pack_verification"]["orphan_bytes"], 0)
+        self.assertEqual(result["fingerprint_mismatches"], [])
         self.assertLess(Path(str(target) + ".objects").stat().st_size, before)
         self.assertEqual(self.db_path.read_bytes(), source_database_bytes)
         self.assertEqual(sessiondb.pack_path(self.db).read_bytes(), source_pack_bytes)
@@ -2019,7 +2216,8 @@ class SessionDBTest(unittest.TestCase):
         self.assertEqual(pack.read_bytes(), pack_bytes[:-1])
         self.assertFalse(target.exists())
         self.assertFalse(Path(str(target) + ".objects").exists())
-        self.assertEqual(list(self.root.glob(".failed-candidate.sqlite.*.tmp*")), [])
+        self.assertEqual(list(self.root.glob(".failed-candidate.sqlite.*")), [])
+        self.assertEqual(list(self.root.glob("failed-candidate.sqlite*")), [])
 
     def test_compaction_policy_reports_not_due_without_creating_a_copy(self):
         source = self.write("compact-policy.jsonl", [
@@ -2816,7 +3014,9 @@ class SessionDBTest(unittest.TestCase):
         db.commit()
         db.close()
         old_roots = full_corpus.ROOTS
+        old_claude_version = sessiondb.ADAPTER_VERSION["claude"]
         try:
+            sessiondb.ADAPTER_VERSION["claude"] = "claude-v7"
             full_corpus.ROOTS = {"claude": (transcripts,)}
             with mock.patch.object(
                 sessiondb, "stable_source_snapshot",
@@ -2824,6 +3024,7 @@ class SessionDBTest(unittest.TestCase):
             ):
                 report = full_corpus.fast_sync(db_path, self.root / "cost-migration.json")
         finally:
+            sessiondb.ADAPTER_VERSION["claude"] = old_claude_version
             full_corpus.ROOTS = old_roots
         self.assertTrue(report["complete"])
         self.assertEqual(report["migrations"][0]["mode"], "metadata-only")
@@ -2995,7 +3196,7 @@ class SessionDBTest(unittest.TestCase):
         try:
             self.assertEqual(
                 {row[0] for row in db.execute("SELECT adapter_version FROM sources")},
-                {"codex-v10"},
+                {sessiondb.ADAPTER_VERSION["codex"]},
             )
             self.assertEqual(db.execute(
                 "SELECT COUNT(*) FROM events WHERE supported=0"
@@ -3126,7 +3327,7 @@ class SessionDBTest(unittest.TestCase):
 
         self.assertEqual(telemetry["attempts"], 0)
         self.assertEqual((admission["admitted_groups"], admission["admitted_events"]), (1, 1))
-        event = self.db.execute("SELECT * FROM events").fetchone()
+        event = self.db.execute(EVENT_ROWS).fetchone()
         self.assertEqual((event["supported"], event["issue"]), (1, None))
         self.assertEqual(sessiondb.read_event_structure(self.db, event), row)
         args = argparse.Namespace(
@@ -3153,7 +3354,7 @@ class SessionDBTest(unittest.TestCase):
         self.assertEqual(sessiondb.ingest(self.db, "claude", source)["issues"], 1)
         admission = sessiondb.apply_auto_metadata_admissions(self.db)
         self.assertEqual(admission["admitted_events"], 1)
-        event = self.db.execute("SELECT * FROM events").fetchone()
+        event = self.db.execute(EVENT_ROWS).fetchone()
         self.assertEqual((event["supported"], event["content_hash"]), (1, None))
 
     def test_admitted_category_revalidates_every_future_shape(self):
@@ -3636,7 +3837,6 @@ class SessionDBTest(unittest.TestCase):
 
 
 
-
     def test_unprojected_events_outside_the_query_do_not_disable_search(self):
         for name in ("scoped-a", "scoped-b"):
             sessiondb.ingest(self.db, "claude", self.write(f"{name}.jsonl", [
@@ -3674,8 +3874,8 @@ class SessionDBTest(unittest.TestCase):
             ]))
         self.db.execute("UPDATE events SET supported=0,issue='test' WHERE session_id='issue-b'")
         self.db.execute(
-            "UPDATE sources SET issue_count=1 WHERE source_id IN "
-            "(SELECT source_id FROM events WHERE session_id='issue-b')"
+            "UPDATE sources SET issue_count=1 WHERE source_key IN "
+            "(SELECT source_key FROM events WHERE session_id='issue-b')"
         )
         self.db.commit()
         self.assertEqual(
@@ -3986,7 +4186,7 @@ class SessionDBTest(unittest.TestCase):
         target_id = sessiondb.parse_retrieval_result_id(result["entries"][10]["result_id"])[0]
         target = self.db.execute(
             "SELECT b.* FROM events e JOIN search_projection_refs r ON r.event_rowid=e.rowid "
-            "JOIN search_projection_blocks b USING(block_key) WHERE e.event_id=?",
+            "JOIN search_projection_blocks b USING(block_key) WHERE e.event_id=unhex(?)",
             (target_id,),
         ).fetchone()
         pack = sessiondb.projection_pack_path(self.db)
@@ -4555,7 +4755,7 @@ class SessionDBTest(unittest.TestCase):
         target = self.root / "replace-compact.sqlite"
         compacted = full_corpus.compact_copy(self.db_path, target)
         self.assertTrue(compacted["complete"])
-        self.assertEqual(compacted["report"]["retrieval_pack_verification"]["orphan_bytes"], 0)
+        self.assertEqual(compacted["retrieval_pack_verification"]["orphan_bytes"], 0)
 
     def test_existing_v9_database_can_ingest_before_explicit_projection_build(self):
         first = self.write("pre-index.jsonl", [
@@ -6051,6 +6251,11 @@ class SessionDBTest(unittest.TestCase):
         cli.write_text("#!/bin/sh\n" + body, encoding="utf-8")
         cli.chmod(0o755)
         return cli
+
+
+
+
+
 
 
 

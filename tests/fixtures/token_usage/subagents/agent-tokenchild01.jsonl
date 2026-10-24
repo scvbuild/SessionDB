@@ -1,0 +1,1 @@
+{"type":"assistant","uuid":"t-c1","sessionId":"sess-token-1","isSidechain":true,"agentId":"tokenchild01","timestamp":"2026-08-11T01:00:05Z","message":{"id":"tm-c1","model":"claude-sonnet-5","usage":{"input_tokens":12,"output_tokens":6}}}

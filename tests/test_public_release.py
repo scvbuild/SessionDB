@@ -131,6 +131,8 @@ class PublicReleaseTest(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform == "darwin", "native event watcher needs macOS")
     def test_installed_native_watcher_events_and_restart(self):
+        if os.environ.get("SESSIONDB_REPAIR_VERIFY"):
+            self.skipTest("candidate parser is verified by source replay; no installed candidate watcher")
         bin_dir = os.environ.get("SESSIONDB_TEST_BIN", str(Path(sys.executable).parent))
         if not (Path(bin_dir) / "sessiondb-freshness").exists():
             self.skipTest("installed watcher requires SESSIONDB_TEST_BIN")
@@ -153,7 +155,7 @@ class PublicReleaseTest(unittest.TestCase):
         for cycle in range(2):
             process = subprocess.Popen(
                 [str(Path(bin_dir) / "sessiondb-freshness"), "--db", str(self.database),
-                 "--debounce", "0.1", "--max-debounce", "0.2"],
+                 "--debounce", "0.1", "--max-debounce", "0.2", "--min-sync-interval", "0"],
                 cwd=self.root, env=self.environment, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
             )
             try:
@@ -168,3 +170,43 @@ class PublicReleaseTest(unittest.TestCase):
                 process.communicate(timeout=10)
             self.assertEqual(process.returncode, 0)
             status.unlink()
+
+    @unittest.skipUnless(sys.platform == "darwin", "native event watcher needs macOS")
+    def test_source_change_restarts_watcher_and_resumes_ingestion(self):
+        if os.environ.get("SESSIONDB_REPAIR_VERIFY"):
+            self.skipTest("candidate verification does not start nested watchers")
+        copied = self.root / "source"
+        shutil.copytree(Path(freshness_service.__file__).parent, copied,
+                        ignore=shutil.ignore_patterns("__pycache__", "*.egg-info"))
+        environment = dict(self.environment, PYTHONPATH=str(copied))
+        status = self.database.parent / "freshness/watcher_status.json"
+        log = self.root / "watcher.log"
+        with log.open("w") as output:
+            process = subprocess.Popen([sys.executable, "-m", "freshness_service", "--db", str(self.database),
+                                        "--min-sync-interval", "0", "--debounce", "0.1"],
+                                       cwd=self.root, env=environment, stdout=output, stderr=output)
+            try:
+                def wait_for(predicate):
+                    deadline = time.monotonic() + 20
+                    while time.monotonic() < deadline:
+                        if process.poll() is not None:
+                            self.fail(log.read_text())
+                        if predicate():
+                            return
+                        time.sleep(0.1)
+                    self.fail(log.read_text())
+                wait_for(lambda: status.exists() and json.loads(status.read_text()).get("pass"))
+                initial = status.stat().st_mtime_ns
+                source = copied / "sessiondb.py"
+                source.write_text(source.read_text() + "\n")
+                wait_for(lambda: "restarting the watcher" in log.read_text()
+                         and status.stat().st_mtime_ns != initial)
+                with (self.claude / "claude.jsonl").open("a") as handle:
+                    handle.write(json.dumps({"type": "user", "sessionId": "demo-claude",
+                                             "message": {"content": "after source restart"}}) + "\n")
+                wait_for(lambda: json.loads(status.read_text()).get("reason") == "filesystem_event")
+                self.assertTrue(json.loads(status.read_text())["pass"])
+            finally:
+                process.terminate()
+                process.wait(timeout=10)
+            self.assertEqual(process.returncode, 0)

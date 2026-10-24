@@ -61,10 +61,11 @@ def raw_structure(db: Any, event: Any, bundles: dict[str, bytes]) -> Any:
     source_id = event["source_id"]
     if source_id not in bundles:
         source = db.execute(
-            "SELECT structure_raw_bytes,structure_zstd FROM sources WHERE source_id=?", (source_id,),
+            "SELECT structure_raw_bytes,structure_zstd,structure_dict_id FROM sources WHERE source_id=?",
+            (source_id,),
         ).fetchone()
-        bundles[source_id] = sessiondb.zstd.decompress(
-            source["structure_zstd"], max_output_size=source["structure_raw_bytes"],
+        bundles[source_id] = sessiondb.decompress_structure_bundle(
+            db, source["structure_zstd"], source["structure_raw_bytes"], source["structure_dict_id"],
         )
     start = event["structure_offset"]
     data = bundles[source_id][start:start + event["structure_bytes"]]
@@ -143,8 +144,9 @@ def session_metadata(db: Any, provider: str, session_id: str) -> Any:
     if provider != "codex":
         return None
     row = db.execute(
-        "SELECT * FROM events WHERE provider=? AND session_id=? AND category='session_meta' "
-        "ORDER BY sequence LIMIT 1", (provider, session_id),
+        f"SELECT {sessiondb.EVENT_COLUMNS} FROM {sessiondb.EVENT_JOIN} "
+        "WHERE e.provider=? AND e.session_id=? AND e.category='session_meta' "
+        "ORDER BY e.sequence LIMIT 1", (provider, session_id),
     ).fetchone()
     if not row:
         return None
@@ -166,9 +168,9 @@ def export_snapshot(
     start_utc = sessiondb.normalize_timestamp(start) or start
     end_utc = sessiondb.normalize_timestamp(end) or end
     events = db.execute(
-        "SELECT e.*,s.path AS source_path FROM events e JOIN sources s USING(source_id) "
+        f"SELECT {sessiondb.EVENT_COLUMNS},src.path AS source_path FROM {sessiondb.EVENT_JOIN} "
         "WHERE e.order_timestamp>=? AND e.order_timestamp<? "
-        "ORDER BY e.provider,e.session_id,e.order_timestamp,e.source_id,e.line_number",
+        "ORDER BY e.provider,e.session_id,e.order_timestamp,src.source_id,e.line_number",
         (start_utc, end_utc),
     ).fetchall()
     bundles: dict[str, bytes] = {}
@@ -179,8 +181,8 @@ def export_snapshot(
         structures[event["event_id"]] = structure
         direct_hashes.update(extra_object_hashes(structure))
         direct_hashes.update(row[0] for row in db.execute(
-            "SELECT object_hash FROM event_content WHERE event_id=? ORDER BY ordinal",
-            (event["event_id"],),
+            "SELECT lower(hex(object_hash)) FROM event_content WHERE event_rowid=? ORDER BY ordinal",
+            (event["event_rowid"],),
         ))
 
     portable = PortableObjects(db)
@@ -194,8 +196,8 @@ def export_snapshot(
     for event in events:
         session_groups[(event["provider"], event["session_id"])].append(event)
         refs = [portable.add(row[0]) for row in db.execute(
-            "SELECT object_hash FROM event_content WHERE event_id=? ORDER BY ordinal",
-            (event["event_id"],),
+            "SELECT lower(hex(object_hash)) FROM event_content WHERE event_rowid=? ORDER BY ordinal",
+            (event["event_rowid"],),
         )]
         if event["tool_event"] and not event["tool"]:
             unresolved.append({

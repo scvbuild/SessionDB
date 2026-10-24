@@ -1,0 +1,1 @@
+{"type":"assistant","uuid":"o-1","sessionId":"sess-root-2","isSidechain":true,"agentId":"orphanagent","timestamp":"2026-08-11T00:02:00Z","message":{"id":"m-orphan-1","model":"claude-sonnet-5","usage":{"input_tokens":4,"output_tokens":2}}}

@@ -4,7 +4,7 @@
 
 SessionDB turns your local Claude Code and Codex transcripts into one searchable history. An agent starting a new session can ask "what did we decide about X last week?" and get the relevant messages back, with a reference to exactly where each one came from. In a test on 20 real history questions, agents using SessionDB answered about 5 times faster than agents searching raw transcripts, with about 40% fewer tokens.
 
-It runs entirely on your Mac, needs no server or account, and never moves or deletes your transcripts.
+Local indexing and search run on your Mac without a server or account. Optional Claude cloud import and agent repair use your signed-in provider account. Normal indexing never moves or deletes your transcripts.
 
 ---
 
@@ -44,7 +44,9 @@ flowchart LR
 
 ---
 
-## Performance
+## Historical performance
+
+These measurements are from 8 October 2026, not a new benchmark of v1.1.0.
 
 **Agents using SessionDB answered about 5 times faster than agents searching raw transcripts, used about 40% fewer tokens, and were right every time.** Same agent (Claude Opus 5.5) on both sides, 20 real history questions, two runs each:
 
@@ -96,17 +98,17 @@ Prefer `/usr/bin/python3` (the tested 3.9). A very new Python, such as 3.14, may
 **2. Install into its own environment** from a checkout of this repository:
 
 ```sh
-/usr/bin/python3 -m venv ~/.local/share/sessiondb/venv
-~/.local/share/sessiondb/venv/bin/python -m pip install .
+/usr/bin/python3 -m venv ~/.local/share/sessiondb-public/venv
+~/.local/share/sessiondb-public/venv/bin/python -m pip install .
 ```
 
-Check: `~/.local/share/sessiondb/venv/bin/sessiondb --help` prints usage. Installing registers no background jobs.
+Check: `~/.local/share/sessiondb-public/venv/bin/sessiondb --help` prints usage. Installing registers no background jobs.
 
 **3. Sync the user's history once.** This reads `~/.claude/projects`, `~/.codex/sessions`, `~/.codex/archived_sessions` and Codex's thread titles in `~/.codex/session_index.jsonl`, and builds the search index. It only reads transcripts; it never moves or deletes them.
 
 ```sh
-mkdir -p ~/.local/share/sessiondb/data
-~/.local/share/sessiondb/venv/bin/sessiondb-freshness --db ~/.local/share/sessiondb/data/sessiondb.sqlite --once
+mkdir -p ~/.local/share/sessiondb-public/data
+~/.local/share/sessiondb-public/venv/bin/sessiondb-freshness --db ~/.local/share/sessiondb-public/data/sessiondb.sqlite --once
 ```
 
 Check: the final status line shows `"coverage_complete": true`. If it lists `blocking_drift_sources` or unsupported content, report them to the user.
@@ -114,7 +116,7 @@ Check: the final status line shows `"coverage_complete": true`. If it lists `blo
 **4. Test a search** using a word the user is likely to have discussed:
 
 ```sh
-~/.local/share/sessiondb/venv/bin/sessiondb --db ~/.local/share/sessiondb/data/sessiondb.sqlite search-index --text 'README'
+~/.local/share/sessiondb-public/venv/bin/sessiondb --db ~/.local/share/sessiondb-public/data/sessiondb.sqlite search-index --text 'README'
 ```
 
 Check: the response has `entries` and `"complete": true`.
@@ -122,7 +124,7 @@ Check: the response has `entries` and `"complete": true`.
 **5. Keep it current (ask the user first).** Either run the foreground watcher in a terminal that stays open (stop it with Control-C), or rerun step 3 before lookups:
 
 ```sh
-~/.local/share/sessiondb/venv/bin/sessiondb-freshness --db ~/.local/share/sessiondb/data/sessiondb.sqlite
+~/.local/share/sessiondb-public/venv/bin/sessiondb-freshness --db ~/.local/share/sessiondb-public/data/sessiondb.sqlite
 ```
 
 Without the watcher, searches still work: newer transcript lines are reported as `affected_sources` instead of being silently missed.
@@ -132,7 +134,7 @@ Without the watcher, searches still work: newer transcript lines are reported as
 ````markdown
 ## Past sessions (SessionDB)
 To find earlier Claude or Codex work, use SessionDB:
-`~/.local/share/sessiondb/venv/bin/sessiondb --db ~/.local/share/sessiondb/data/sessiondb.sqlite <command>`
+`~/.local/share/sessiondb-public/venv/bin/sessiondb --db ~/.local/share/sessiondb-public/data/sessiondb.sqlite <command>`
 1. Search: `search-index --format text --text '<2-4 distinctive words>'`. If the request gives a session ID, date, or exact string, filter by it (`--session`, `--since`/`--until`, quoted text). Words combine with AND; use `a OR b` and `'"exact phrase"'`; `--role user|assistant` limits the speaker.
 2. To find where an exact string first or ever appeared, search it in quotes with `--order chronological`. Inside one session, search it (`--session <id>`) instead of reading through it. For anything you would do with grep, rg, or a script on transcript files, use `grep '<regex>'` (`-F` exact text, `-i`, `-l` lists sessions with counts and first and last times, `--session`, `--since`/`--until`) or `record-stream --session <id> --output -` (the session's original records, one JSON object per line). To list sessions by date or title, use `sessions --since <date> --until <date>` or `sessions --title '<words>'`.
 3. Read when the shown evidence is not enough: run the session's ready `read … --line L --evidence` command. `--full` shows one record unabridged; `read --session <id> --tail 1` prints its title, time span, app, model and folder.
@@ -216,7 +218,7 @@ Search and query filters include `--provider`, `--project`, `--session`, `--role
 
 ### Watcher
 
-`sessiondb-freshness` discovers `~/.claude/projects`, `~/.codex/sessions`, `~/.codex/archived_sessions`, and Codex's title index `~/.codex/session_index.jsonl`. With `--once` it syncs once; without it, it runs in the foreground until stopped. Status is written to `freshness/watcher_status.json` beside the database. No scheduler, messaging service, or repair agent is registered or launched.
+`sessiondb-freshness` discovers `~/.claude/projects`, `~/.codex/sessions`, `~/.codex/archived_sessions`, and Codex's title index `~/.codex/session_index.jsonl`. With `--once` it syncs once; without it, it runs in the foreground until stopped. Status is written to `freshness/watcher_status.json` beside the database. No scheduler or messaging service is registered. Agent repair is off unless you explicitly select `--auto-repair codex` or `--auto-repair claude`; see [optional repair and upgrades](docs/release/Operations.md).
 
 Records being written may be reported as catching up. Persistent drift, unreadable evidence, failed migrations, and unsupported content-bearing shapes stay visible and can make affected queries incomplete. An issue with one provider does not invalidate evidence from the other.
 
@@ -245,9 +247,11 @@ SessionDB runs locally, but its stored content can include credentials, customer
 - Keep databases, packs, result bundles, snapshots, and watcher status files private.
 - Normal syncing never moves or deletes transcripts. When a provider confirms it deleted a session, SessionDB removes that session's indexed records and derived copies; keep backups if recovery matters.
 
-This is **SessionDB v1.0.1**, a bug-fix release of the first public release, under the [MIT license](LICENSE). It includes local sync, storage, search, evidence retrieval, export/backup, and a foreground macOS watcher. Automatic agent repair, external notifications, scheduled nightly audits, agent benchmarks, and the walkthrough app are not included.
+This is **SessionDB v1.1.0**, under the [MIT license](LICENSE). It adds current Claude/Codex record support, token-usage accounting, storage-copy tools, optional Claude cloud import, and optional automatic parser repair with Codex or Claude. External notifications, scheduled audits, agent benchmarks, and the walkthrough app are not included.
 
-All 276 synthetic tests pass, including installed commands and native macOS watcher events. See the [release scope](docs/release/Release%20scope.md), [verification report](docs/release/Verification%20results.md), and [recorded measurements](docs/release/synthetic-performance.json).
+**Upgrading from v1.0.x:** stop the watcher and create a migrated database copy before using v1.1.0. **Automatic repair:** requires an editable checkout and permission to send redacted evidence to the selected model provider and activate verified parser changes. Follow [Operations](docs/release/Operations.md).
+
+See the [release scope](docs/release/Release%20scope.md) and [verification report](docs/release/Verification%20results.md). The [recorded measurements](docs/release/synthetic-performance.json) are historical, not v1.1.0 performance results.
 
 ## Development
 
@@ -256,7 +260,7 @@ All 276 synthetic tests pass, including installed commands and native macOS watc
 | `src/` | Library and command-line tools |
 | `tests/` | Synthetic tests |
 | `examples/` | Invented Claude and Codex records |
-| `scripts/` | Rebuild-readiness tooling |
+| `scripts/` | Rebuild-readiness tooling and optional real-agent repair checks |
 | `docs/release/` | Release scope, extraction manifest, verification, and measurements |
 
 Run the test suite:
@@ -265,4 +269,4 @@ Run the test suite:
 PYTHONPATH=src .venv/bin/python -m unittest discover -s tests
 ```
 
-For installed-command tests, set `SESSIONDB_TEST_BIN` to the virtual environment's `bin` directory. When another SessionDB installation exists, test with an isolated home and database or a separate account. Retained and omitted tests are listed in the [extraction manifest](docs/release/extraction-manifest.json).
+For installed-command tests, set `SESSIONDB_TEST_BIN` to the virtual environment's `bin` directory. When another SessionDB installation exists, test with an isolated home and database or a separate account. Module hashes and the included tests are listed in the [release manifest](docs/release/extraction-manifest.json).

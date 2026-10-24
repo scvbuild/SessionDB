@@ -1,0 +1,1 @@
+{"type":"assistant","uuid":"g-1","sessionId":"sess-root-1","isSidechain":true,"agentId":"grandkidagent","timestamp":"2026-08-11T00:00:15Z","message":{"id":"m-grand-1","model":"claude-haiku-4-5","usage":{"input_tokens":9,"output_tokens":3}}}

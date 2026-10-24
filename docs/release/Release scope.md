@@ -1,28 +1,22 @@
-# First public release scope
+# Release scope: v1.1.0
 
-The first public release is a standalone copy. It does not replace or modify the private installation. Publication and program applications are separate from installation.
+This release updates local storage and retrieval, provider record handling, token-usage derivation, and incremental watcher behavior. The package includes eight modules: sessiondb, full_corpus, snapshot_export, freshness_service, cloud_fetch, token_usage, rebuild_copy, and repair_agent.
 
-## Source boundary
+## Component and failure boundaries
 
-The retained source modules are `sessiondb`, `full_corpus`, `snapshot_export`, and `freshness_service`. `full_corpus` and `snapshot_export` are copied unchanged. `sessiondb` changes only the rebuild-receipt storage namespace. The watcher retains the original ingestion, receipt verification, drift classification, migration reporting, bounded database-lock retry, and FSEvents recovery helpers; status reporting and the watch loop are adapted to local-only operation.
-
-No source transcripts, databases, original Git history, credentials, evaluation corpora, evaluation result files, or historical reports are included. The only evaluation utility retained is the standalone rebuild-readiness generator.
-
-## Impact map
-
-| Component | Disposition |
+| Component | Behavior and scope |
 | --- | --- |
-| Private installation, database, schedules and repair launcher | Unaffected; no deployment or writes |
-| Public retrieval/storage engine | Retained, with a separate receipt-ledger namespace |
-| Public foreground watcher | Local status and errors; no repair agent or external notification |
-| Public exports/admin commands | Retained; explicit database and output paths |
-| Rebuild-readiness utility | Included with the frozen-code, corpus and review gates retained |
-| Nightly service, retrieval audit, agent benchmark and walkthrough | Excluded from this release |
-| Existing synthetic tests | Retained methods unchanged; removed imports/methods recorded |
-| New release-boundary tests | Exercise local status, process isolation and installed commands |
+| Local engine | Schema 12, searchable projections, reconstructable records, redacted output and scope-specific coverage |
+| Foreground watcher | Incremental synchronization, batched changes, WAL connection maintenance, native macOS events and restart after source changes |
+| Optional repair | Explicit provider selection; bounded evidence and candidate edits; verification before activation; rollback after failed ingestion |
+| Optional cloud import | Explicit command using Claude login; separate per-session failures; no schedule |
+| Copy tools | Verified copy and explicit promotion; no service management or installer |
+| Package data | Synthetic tests and examples; no source transcripts, databases, credentials or model logs |
 
-## Verification boundary
+Repair follows this lifecycle: disabled → confirming → running → restart required → verified. Unsafe candidates stop as blocked or no-safe-repair; unsuccessful post-activation ingestion rolls back. Coverage remains a separate statement about indexed evidence. Parser repair cannot resolve missing credentials, unreadable source files, general infrastructure faults, or arbitrary code defects.
 
-Verification uses isolated homes and synthetic databases. Verify installed commands for both providers, unknown-shape reporting without agent launch, retry behavior, restart and native watcher events, query-scoped coverage, export, receipt namespace isolation, and equality of retained test methods. Compare retrieval and ingestion on identical synthetic records against the private engine. Production-corpus latency, broad platform compatibility, and public adoption are unverified.
+The public data namespace is `~/.local/share/sessiondb-public`. No running installation, database, background job or agent instruction is changed merely by publishing or installing the package. External notifications, scheduled audits, benchmarks and a walkthrough application are excluded.
 
-The private source is the extraction baseline; after this release the two codebases are temporarily independent. Fixes must be consciously carried across until one source is selected. Work amplification is not applicable to a production rollout because no installed production unit is changed.
+## Verification limits
+
+Checks use synthetic records and isolated databases. Real Codex and Claude calls exercise the optional repair handoff; they do not establish that every future format change is safely repairable. Linux, Windows, live cloud endpoints, production-corpus performance and unknown future provider formats are unverified. Historical performance records are retained with their original dates.

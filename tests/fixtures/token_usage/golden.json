@@ -1,0 +1,750 @@
+{
+  "claude.jsonl": {
+    "context": [
+      {
+        "cached_input_context_tokens": 30,
+        "compaction_phase": null,
+        "event_id": "093a36bc2a28e0c14c3139428be6c718bcc146708c132ed617478c20db153d1f",
+        "event_kind": "normal",
+        "input_context_tokens": 150,
+        "model_context_window": null,
+        "observed_at": "2026-08-10T00:00:00.000000Z",
+        "provider": "anthropic",
+        "run_id": "session-1",
+        "source_event_id": "msg-1"
+      },
+      {
+        "cached_input_context_tokens": null,
+        "compaction_phase": null,
+        "event_id": "8e56f50d3fc4427aeccef1759e184ea56d59d93786cfcfd68c44df52b8b457c8",
+        "event_kind": "normal",
+        "input_context_tokens": 5,
+        "model_context_window": null,
+        "observed_at": "2026-08-10T00:01:00.000000Z",
+        "provider": "anthropic",
+        "run_id": "b660133d0f95c17fc43fd2dd905fc4eaf7f18c4561ae21c4f54955973379facb",
+        "source_event_id": "msg-child"
+      }
+    ],
+    "provider": "claude",
+    "runs": [
+      {
+        "ended_at": "2026-08-10T00:00:01.000000Z",
+        "model": "claude-opus-4-1",
+        "parent_run_id": null,
+        "provider": "anthropic",
+        "root_run_id": "session-1",
+        "run_id": "session-1",
+        "run_kind": "root",
+        "started_at": "2026-08-10T00:00:00.000000Z",
+        "status": "unknown"
+      },
+      {
+        "ended_at": "2026-08-10T00:01:00.000000Z",
+        "model": "claude-sonnet-4",
+        "parent_run_id": null,
+        "provider": "anthropic",
+        "root_run_id": "b660133d0f95c17fc43fd2dd905fc4eaf7f18c4561ae21c4f54955973379facb",
+        "run_id": "b660133d0f95c17fc43fd2dd905fc4eaf7f18c4561ae21c4f54955973379facb",
+        "run_kind": "subagent",
+        "started_at": "2026-08-10T00:01:00.000000Z",
+        "status": "unknown"
+      }
+    ],
+    "usage": [
+      {
+        "cache_read_input_tokens": 30,
+        "cache_write_input_tokens": 20,
+        "event_id": "bee7582bf0d451d7f03fc90232b362142ef351ef656dfb14c0f657acaa834f72",
+        "input_tokens": 150,
+        "observed_at": "2026-08-10T00:00:00.000000Z",
+        "output_tokens": 50,
+        "provider": "anthropic",
+        "reasoning_output_tokens": 12,
+        "run_id": "session-1",
+        "source_event_id": "msg-1",
+        "total_tokens": 200
+      },
+      {
+        "cache_read_input_tokens": null,
+        "cache_write_input_tokens": null,
+        "event_id": "861b682a4b2b6dc56c7491c47d960d4ca46106224057dbedd6db79e8b852d8d1",
+        "input_tokens": 5,
+        "observed_at": "2026-08-10T00:01:00.000000Z",
+        "output_tokens": 7,
+        "provider": "anthropic",
+        "reasoning_output_tokens": null,
+        "run_id": "b660133d0f95c17fc43fd2dd905fc4eaf7f18c4561ae21c4f54955973379facb",
+        "source_event_id": "msg-child",
+        "total_tokens": 12
+      }
+    ]
+  },
+  "claude_child_delegation.jsonl": {
+    "context": [
+      {
+        "cached_input_context_tokens": 5,
+        "compaction_phase": null,
+        "event_id": "86e9d43672bf096285a0facfde22c556e5dd12cb2a1c612f6c492138e2c140ae",
+        "event_kind": "normal",
+        "input_context_tokens": 55,
+        "model_context_window": null,
+        "observed_at": "2026-08-11T00:00:10.000000Z",
+        "provider": "anthropic",
+        "run_id": "ddc50ad9f53d97b6f2a3e71d0228be81b340ff6f442e2b0ac11a7caf0387a911",
+        "source_event_id": "m-child-1"
+      }
+    ],
+    "provider": "claude",
+    "runs": [
+      {
+        "ended_at": "2026-08-11T00:00:20.000000Z",
+        "model": "claude-sonnet-5",
+        "parent_run_id": null,
+        "provider": "anthropic",
+        "root_run_id": "ddc50ad9f53d97b6f2a3e71d0228be81b340ff6f442e2b0ac11a7caf0387a911",
+        "run_id": "ddc50ad9f53d97b6f2a3e71d0228be81b340ff6f442e2b0ac11a7caf0387a911",
+        "run_kind": "subagent",
+        "started_at": "2026-08-11T00:00:10.000000Z",
+        "status": "unknown"
+      },
+      {
+        "ended_at": null,
+        "model": null,
+        "parent_run_id": "ddc50ad9f53d97b6f2a3e71d0228be81b340ff6f442e2b0ac11a7caf0387a911",
+        "provider": "anthropic",
+        "root_run_id": "ddc50ad9f53d97b6f2a3e71d0228be81b340ff6f442e2b0ac11a7caf0387a911",
+        "run_id": "c6bb03f1afb9bc3e95838a519bd2e8a74ac3060e68b3668016f9f81e24136b3c",
+        "run_kind": "subagent",
+        "started_at": null,
+        "status": "completed"
+      }
+    ],
+    "usage": [
+      {
+        "cache_read_input_tokens": 5,
+        "cache_write_input_tokens": null,
+        "event_id": "a1b5c3fdba02b9976e810f44177c9f24d5cd5e0772bffd81ebedbea37fc16af8",
+        "input_tokens": 55,
+        "observed_at": "2026-08-11T00:00:10.000000Z",
+        "output_tokens": 11,
+        "provider": "anthropic",
+        "reasoning_output_tokens": null,
+        "run_id": "ddc50ad9f53d97b6f2a3e71d0228be81b340ff6f442e2b0ac11a7caf0387a911",
+        "source_event_id": "m-child-1",
+        "total_tokens": 66
+      }
+    ]
+  },
+  "claude_grandchild.jsonl": {
+    "context": [
+      {
+        "cached_input_context_tokens": null,
+        "compaction_phase": null,
+        "event_id": "235e47c056f6f78e249d97f5efd2e5c886de1e45bb0ae4177882fe926c23b1fd",
+        "event_kind": "normal",
+        "input_context_tokens": 9,
+        "model_context_window": null,
+        "observed_at": "2026-08-11T00:00:15.000000Z",
+        "provider": "anthropic",
+        "run_id": "c6bb03f1afb9bc3e95838a519bd2e8a74ac3060e68b3668016f9f81e24136b3c",
+        "source_event_id": "m-grand-1"
+      }
+    ],
+    "provider": "claude",
+    "runs": [
+      {
+        "ended_at": "2026-08-11T00:00:15.000000Z",
+        "model": "claude-haiku-4-5",
+        "parent_run_id": null,
+        "provider": "anthropic",
+        "root_run_id": "c6bb03f1afb9bc3e95838a519bd2e8a74ac3060e68b3668016f9f81e24136b3c",
+        "run_id": "c6bb03f1afb9bc3e95838a519bd2e8a74ac3060e68b3668016f9f81e24136b3c",
+        "run_kind": "subagent",
+        "started_at": "2026-08-11T00:00:15.000000Z",
+        "status": "unknown"
+      }
+    ],
+    "usage": [
+      {
+        "cache_read_input_tokens": null,
+        "cache_write_input_tokens": null,
+        "event_id": "8cfe6e2e8dbc05d9405aedfaefffedbc3db30e470bda83e28c5b74935c188ec2",
+        "input_tokens": 9,
+        "observed_at": "2026-08-11T00:00:15.000000Z",
+        "output_tokens": 3,
+        "provider": "anthropic",
+        "reasoning_output_tokens": null,
+        "run_id": "c6bb03f1afb9bc3e95838a519bd2e8a74ac3060e68b3668016f9f81e24136b3c",
+        "source_event_id": "m-grand-1",
+        "total_tokens": 12
+      }
+    ]
+  },
+  "claude_orphan_child.jsonl": {
+    "context": [
+      {
+        "cached_input_context_tokens": null,
+        "compaction_phase": null,
+        "event_id": "c3ed8b3503c3748dce4b777b9434a1e7a33607076681678913e78675fac3091d",
+        "event_kind": "normal",
+        "input_context_tokens": 4,
+        "model_context_window": null,
+        "observed_at": "2026-08-11T00:02:00.000000Z",
+        "provider": "anthropic",
+        "run_id": "7aa92a7d3014843e2e9da2e4864a252563f1b543e58153757c1a4efc231086a1",
+        "source_event_id": "m-orphan-1"
+      }
+    ],
+    "provider": "claude",
+    "runs": [
+      {
+        "ended_at": "2026-08-11T00:02:00.000000Z",
+        "model": "claude-sonnet-5",
+        "parent_run_id": null,
+        "provider": "anthropic",
+        "root_run_id": "7aa92a7d3014843e2e9da2e4864a252563f1b543e58153757c1a4efc231086a1",
+        "run_id": "7aa92a7d3014843e2e9da2e4864a252563f1b543e58153757c1a4efc231086a1",
+        "run_kind": "subagent",
+        "started_at": "2026-08-11T00:02:00.000000Z",
+        "status": "unknown"
+      }
+    ],
+    "usage": [
+      {
+        "cache_read_input_tokens": null,
+        "cache_write_input_tokens": null,
+        "event_id": "a8fb6c9022a9e6f64376084875ffd68c6a60ee3df4dc0ab2089230406a5d762a",
+        "input_tokens": 4,
+        "observed_at": "2026-08-11T00:02:00.000000Z",
+        "output_tokens": 2,
+        "provider": "anthropic",
+        "reasoning_output_tokens": null,
+        "run_id": "7aa92a7d3014843e2e9da2e4864a252563f1b543e58153757c1a4efc231086a1",
+        "source_event_id": "m-orphan-1",
+        "total_tokens": 6
+      }
+    ]
+  },
+  "claude_root_delegation.jsonl": {
+    "context": [
+      {
+        "cached_input_context_tokens": 40,
+        "compaction_phase": null,
+        "event_id": "b8cfa917204e977fef208558d086dbe6d8125da49604bc03291bf91c8e301b3d",
+        "event_kind": "normal",
+        "input_context_tokens": 150,
+        "model_context_window": null,
+        "observed_at": "2026-08-11T00:00:00.000000Z",
+        "provider": "anthropic",
+        "run_id": "sess-root-1",
+        "source_event_id": "m-root-1"
+      },
+      {
+        "cached_input_context_tokens": null,
+        "compaction_phase": null,
+        "event_id": "90b901977d6f614ba5e98a3d058a7e02ff2913fb669700bd49a47f8061e39d90",
+        "event_kind": "normal",
+        "input_context_tokens": 200,
+        "model_context_window": null,
+        "observed_at": "2026-08-11T00:01:00.000000Z",
+        "provider": "anthropic",
+        "run_id": "sess-root-1",
+        "source_event_id": "m-root-2"
+      }
+    ],
+    "provider": "claude",
+    "runs": [
+      {
+        "ended_at": "2026-08-11T00:01:05.000000Z",
+        "model": "claude-opus-5",
+        "parent_run_id": null,
+        "provider": "anthropic",
+        "root_run_id": "sess-root-1",
+        "run_id": "sess-root-1",
+        "run_kind": "root",
+        "started_at": "2026-08-11T00:00:00.000000Z",
+        "status": "unknown"
+      },
+      {
+        "ended_at": null,
+        "model": null,
+        "parent_run_id": "sess-root-1",
+        "provider": "anthropic",
+        "root_run_id": "sess-root-1",
+        "run_id": "32df00282f2db8336e5e71726d4cd59fe817cc990cc724ab53d767d0de167c6d",
+        "run_kind": "subagent",
+        "started_at": null,
+        "status": "running"
+      },
+      {
+        "ended_at": null,
+        "model": null,
+        "parent_run_id": "sess-root-1",
+        "provider": "anthropic",
+        "root_run_id": "sess-root-1",
+        "run_id": "ddc50ad9f53d97b6f2a3e71d0228be81b340ff6f442e2b0ac11a7caf0387a911",
+        "run_kind": "subagent",
+        "started_at": null,
+        "status": "completed"
+      }
+    ],
+    "usage": [
+      {
+        "cache_read_input_tokens": 40,
+        "cache_write_input_tokens": 10,
+        "event_id": "efc94bd342faf21a32b82bc58e3765ff7b16c0317e85905666002ab03a10eea8",
+        "input_tokens": 150,
+        "observed_at": "2026-08-11T00:00:00.000000Z",
+        "output_tokens": 20,
+        "provider": "anthropic",
+        "reasoning_output_tokens": null,
+        "run_id": "sess-root-1",
+        "source_event_id": "m-root-1",
+        "total_tokens": 170
+      },
+      {
+        "cache_read_input_tokens": null,
+        "cache_write_input_tokens": null,
+        "event_id": "3988cf565ce02fac8941e146b112d1ab2565f809a658688e1daaae9259f54600",
+        "input_tokens": 200,
+        "observed_at": "2026-08-11T00:01:00.000000Z",
+        "output_tokens": 30,
+        "provider": "anthropic",
+        "reasoning_output_tokens": null,
+        "run_id": "sess-root-1",
+        "source_event_id": "m-root-2",
+        "total_tokens": 230
+      }
+    ]
+  },
+  "claude_token_root.jsonl": {
+    "context": [
+      {
+        "cached_input_context_tokens": null,
+        "compaction_phase": null,
+        "event_id": "61152f802fe86697a8c5e5979706e030d19ad9fa45e2d65c91a3270e53dd7d7a",
+        "event_kind": "normal",
+        "input_context_tokens": 30,
+        "model_context_window": null,
+        "observed_at": "2026-08-11T01:00:00.000000Z",
+        "provider": "anthropic",
+        "run_id": "sess-token-1",
+        "source_event_id": "tm-1"
+      }
+    ],
+    "provider": "claude",
+    "runs": [
+      {
+        "ended_at": "2026-08-11T01:00:20.000000Z",
+        "model": "claude-opus-5",
+        "parent_run_id": null,
+        "provider": "anthropic",
+        "root_run_id": "sess-token-1",
+        "run_id": "sess-token-1",
+        "run_kind": "root",
+        "started_at": "2026-08-11T01:00:00.000000Z",
+        "status": "unknown"
+      }
+    ],
+    "usage": [
+      {
+        "cache_read_input_tokens": null,
+        "cache_write_input_tokens": null,
+        "event_id": "f033f14795c9fffc4ddb5f29eea252a8ae419a503e343f8d315493c4551699f9",
+        "input_tokens": 30,
+        "observed_at": "2026-08-11T01:00:00.000000Z",
+        "output_tokens": 4,
+        "provider": "anthropic",
+        "reasoning_output_tokens": null,
+        "run_id": "sess-token-1",
+        "source_event_id": "tm-1",
+        "total_tokens": 34
+      }
+    ]
+  },
+  "codex.jsonl": {
+    "context": [],
+    "provider": "codex",
+    "runs": [
+      {
+        "ended_at": null,
+        "model": "gpt-5",
+        "parent_run_id": null,
+        "provider": "codex",
+        "root_run_id": "root-session",
+        "run_id": "root-session",
+        "run_kind": "root",
+        "started_at": "2026-08-10T00:00:00.000000Z",
+        "status": "completed"
+      }
+    ],
+    "usage": [
+      {
+        "cache_read_input_tokens": 10,
+        "cache_write_input_tokens": null,
+        "event_id": "03e25f72dec4ea5e5141c75e63b8d838c1a2e27b76592b8869f4c6dbfedbfdb5",
+        "input_tokens": 40,
+        "observed_at": "2026-08-10T00:00:03.000000Z",
+        "output_tokens": 20,
+        "provider": "codex",
+        "reasoning_output_tokens": 5,
+        "run_id": "root-session",
+        "source_event_id": "count-2",
+        "total_tokens": 60
+      },
+      {
+        "cache_read_input_tokens": 20,
+        "cache_write_input_tokens": null,
+        "event_id": "251b4e04308d2443df8f8bc4820d4eec08e2fe1dd3ab76c37972a6a2e0fc16cd",
+        "input_tokens": 100,
+        "observed_at": "2026-08-10T00:00:02.000000Z",
+        "output_tokens": 30,
+        "provider": "codex",
+        "reasoning_output_tokens": 10,
+        "run_id": "root-session",
+        "source_event_id": "count-1",
+        "total_tokens": 130
+      },
+      {
+        "cache_read_input_tokens": 5,
+        "cache_write_input_tokens": null,
+        "event_id": "1589dd97e47df497b20de6a011afa40ef6bd3a45976bce8498aa395a80b8f441",
+        "input_tokens": 20,
+        "observed_at": "2026-08-10T00:00:05.000000Z",
+        "output_tokens": 8,
+        "provider": "codex",
+        "reasoning_output_tokens": 2,
+        "run_id": "root-session",
+        "source_event_id": "count-3",
+        "total_tokens": 28
+      }
+    ]
+  },
+  "subagents/agent-tokenchild01.jsonl": {
+    "context": [
+      {
+        "cached_input_context_tokens": null,
+        "compaction_phase": null,
+        "event_id": "655a91c3886a7844b537142a7265fbb7028a5ab4e250735ce889436c6beebd34",
+        "event_kind": "normal",
+        "input_context_tokens": 12,
+        "model_context_window": null,
+        "observed_at": "2026-08-11T01:00:05.000000Z",
+        "provider": "anthropic",
+        "run_id": "54ba54b736c6a34d9c5312f056c14ea5712a1487e4aeb2b03c7aebaeca341ba1",
+        "source_event_id": "tm-c1"
+      }
+    ],
+    "provider": "claude",
+    "runs": [
+      {
+        "ended_at": "2026-08-11T01:00:05.000000Z",
+        "model": "claude-sonnet-5",
+        "parent_run_id": null,
+        "provider": "anthropic",
+        "root_run_id": "54ba54b736c6a34d9c5312f056c14ea5712a1487e4aeb2b03c7aebaeca341ba1",
+        "run_id": "54ba54b736c6a34d9c5312f056c14ea5712a1487e4aeb2b03c7aebaeca341ba1",
+        "run_kind": "subagent",
+        "started_at": "2026-08-11T01:00:05.000000Z",
+        "status": "unknown"
+      }
+    ],
+    "usage": [
+      {
+        "cache_read_input_tokens": null,
+        "cache_write_input_tokens": null,
+        "event_id": "af4886fb591a638cb28c29a885d08fbcd44daad1d5bc876ab5bcab2dfde1badb",
+        "input_tokens": 12,
+        "observed_at": "2026-08-11T01:00:05.000000Z",
+        "output_tokens": 6,
+        "provider": "anthropic",
+        "reasoning_output_tokens": null,
+        "run_id": "54ba54b736c6a34d9c5312f056c14ea5712a1487e4aeb2b03c7aebaeca341ba1",
+        "source_event_id": "tm-c1",
+        "total_tokens": 18
+      }
+    ]
+  },
+  "synthetic_claude_stream.jsonl": {
+    "context": [
+      {
+        "cached_input_context_tokens": 3,
+        "compaction_phase": null,
+        "event_id": "957c63c1f009949de4195664df681447beb01851229a8f4eb4b8def7bbaa6341",
+        "event_kind": "normal",
+        "input_context_tokens": 15,
+        "model_context_window": null,
+        "observed_at": "2026-10-01T00:00:00.000000Z",
+        "provider": "anthropic",
+        "run_id": "stream-1",
+        "source_event_id": "m1"
+      },
+      {
+        "cached_input_context_tokens": 3,
+        "compaction_phase": null,
+        "event_id": "ae05c0346f465b9f30bd5934149606fc9dd0125cefa64190434d1d5b92dcc0ec",
+        "event_kind": "normal",
+        "input_context_tokens": 15,
+        "model_context_window": null,
+        "observed_at": "2026-10-01T00:00:05.000000Z",
+        "provider": "anthropic",
+        "run_id": "10565b19f6e0e004a7a59df7d725bbda91fde3eb91675b44dd6d1085b9c9fbdc",
+        "source_event_id": "m3"
+      },
+      {
+        "cached_input_context_tokens": 3,
+        "compaction_phase": null,
+        "event_id": "db43eba522484633fa4e6a2458867bc90493b24fd38b6e0f3fc9741ab2f7d273",
+        "event_kind": "normal",
+        "input_context_tokens": 15,
+        "model_context_window": null,
+        "observed_at": "2026-10-01T00:00:03.000000Z",
+        "provider": "anthropic",
+        "run_id": "stream-1",
+        "source_event_id": "m2"
+      },
+      {
+        "cached_input_context_tokens": null,
+        "compaction_phase": "post",
+        "event_id": "d829303b9fd2e8593144dc0df09c8844da04eef966c69ceeebc0c5def22a3bbe",
+        "event_kind": "compaction",
+        "input_context_tokens": 100,
+        "model_context_window": null,
+        "observed_at": "2026-10-01T00:00:02.000000Z",
+        "provider": "anthropic",
+        "run_id": "stream-1",
+        "source_event_id": "b1:post"
+      },
+      {
+        "cached_input_context_tokens": null,
+        "compaction_phase": "pre",
+        "event_id": "a95f0dacce1c9a78d2cf9375c6a32be00a8251cfc2e40471cc78a0e4d2920ca0",
+        "event_kind": "compaction",
+        "input_context_tokens": 900,
+        "model_context_window": null,
+        "observed_at": "2026-10-01T00:00:02.000000Z",
+        "provider": "anthropic",
+        "run_id": "stream-1",
+        "source_event_id": "b1:pre"
+      }
+    ],
+    "provider": "claude",
+    "runs": [
+      {
+        "ended_at": "2026-10-01T00:00:05.000000Z",
+        "model": "claude-opus-5",
+        "parent_run_id": null,
+        "provider": "anthropic",
+        "root_run_id": "10565b19f6e0e004a7a59df7d725bbda91fde3eb91675b44dd6d1085b9c9fbdc",
+        "run_id": "10565b19f6e0e004a7a59df7d725bbda91fde3eb91675b44dd6d1085b9c9fbdc",
+        "run_kind": "subagent",
+        "started_at": "2026-10-01T00:00:05.000000Z",
+        "status": "unknown"
+      },
+      {
+        "ended_at": "2026-10-01T00:00:06.000000Z",
+        "model": "claude-opus-5",
+        "parent_run_id": null,
+        "provider": "anthropic",
+        "root_run_id": "stream-1",
+        "run_id": "stream-1",
+        "run_kind": "root",
+        "started_at": "2026-10-01T00:00:00.000000Z",
+        "status": "unknown"
+      },
+      {
+        "ended_at": null,
+        "model": null,
+        "parent_run_id": "stream-1",
+        "provider": "anthropic",
+        "root_run_id": "stream-1",
+        "run_id": "0d6c48485e547f30050e18145ecd34098c76aa6f2cc1d50d13cc790e59507a68",
+        "run_kind": "subagent",
+        "started_at": null,
+        "status": "completed"
+      }
+    ],
+    "usage": [
+      {
+        "cache_read_input_tokens": 3,
+        "cache_write_input_tokens": 2,
+        "event_id": "3619ebe254d69b5fd74e020173ef0647b898ec261a5df38f5cfa0117fa278f68",
+        "input_tokens": 15,
+        "observed_at": "2026-10-01T00:00:03.000000Z",
+        "output_tokens": 7,
+        "provider": "anthropic",
+        "reasoning_output_tokens": null,
+        "run_id": "stream-1",
+        "source_event_id": "m2",
+        "total_tokens": 22
+      },
+      {
+        "cache_read_input_tokens": 3,
+        "cache_write_input_tokens": 2,
+        "event_id": "3e9e2bc6550c04597be3750214149c68df6a1f69e2a0f02a190fb9e99035cd35",
+        "input_tokens": 15,
+        "observed_at": "2026-10-01T00:00:05.000000Z",
+        "output_tokens": 4,
+        "provider": "anthropic",
+        "reasoning_output_tokens": null,
+        "run_id": "10565b19f6e0e004a7a59df7d725bbda91fde3eb91675b44dd6d1085b9c9fbdc",
+        "source_event_id": "m3",
+        "total_tokens": 19
+      },
+      {
+        "cache_read_input_tokens": 3,
+        "cache_write_input_tokens": 2,
+        "event_id": "cc80a6fdc015967d2e074caa0a818c87f032ca655b3140f55cf335782c9ec356",
+        "input_tokens": 15,
+        "observed_at": "2026-10-01T00:00:04.000000Z",
+        "output_tokens": 9,
+        "provider": "anthropic",
+        "reasoning_output_tokens": 3,
+        "run_id": "stream-1",
+        "source_event_id": "m1",
+        "total_tokens": 24
+      }
+    ]
+  },
+  "synthetic_codex_cumulative.jsonl": {
+    "context": [
+      {
+        "cached_input_context_tokens": null,
+        "compaction_phase": "marker",
+        "event_id": "e6a374fd12211efc4245bb82b931831ced389e2108decd15b548808f637545de",
+        "event_kind": "compaction",
+        "input_context_tokens": null,
+        "model_context_window": null,
+        "observed_at": "2026-10-03T00:00:04.000000Z",
+        "provider": "codex",
+        "run_id": "cumulative-1",
+        "source_event_id": null
+      }
+    ],
+    "provider": "codex",
+    "runs": [
+      {
+        "ended_at": null,
+        "model": "gpt-6",
+        "parent_run_id": null,
+        "provider": "codex",
+        "root_run_id": "cumulative-1",
+        "run_id": "cumulative-1",
+        "run_kind": "root",
+        "started_at": "2026-10-02T00:00:00.000000Z",
+        "status": "running"
+      }
+    ],
+    "usage": [
+      {
+        "cache_read_input_tokens": null,
+        "cache_write_input_tokens": null,
+        "event_id": "244b26c701d79b3194c0c0d1c094cdd2e63a2591ec0cb30abfab4af55acb2ccb",
+        "input_tokens": 80,
+        "observed_at": "2026-10-03T00:00:03.000000Z",
+        "output_tokens": 20,
+        "provider": "codex",
+        "reasoning_output_tokens": 5,
+        "run_id": "cumulative-1",
+        "source_event_id": null,
+        "total_tokens": 100
+      },
+      {
+        "cache_read_input_tokens": null,
+        "cache_write_input_tokens": null,
+        "event_id": "284170efc07631e03a2e4a4a2fb17722db583ef72bf786def6708d5dd9097f69",
+        "input_tokens": 100,
+        "observed_at": "2026-10-03T00:00:01.000000Z",
+        "output_tokens": 10,
+        "provider": "codex",
+        "reasoning_output_tokens": null,
+        "run_id": "cumulative-1",
+        "source_event_id": null,
+        "total_tokens": 110
+      },
+      {
+        "cache_read_input_tokens": null,
+        "cache_write_input_tokens": null,
+        "event_id": "f6581cc5a39808650f46e448b548b293322ef9fe9247df7406bde025b753e343",
+        "input_tokens": 45,
+        "observed_at": "2026-10-03T00:00:05.000000Z",
+        "output_tokens": 5,
+        "provider": "codex",
+        "reasoning_output_tokens": null,
+        "run_id": "cumulative-1",
+        "source_event_id": null,
+        "total_tokens": 50
+      }
+    ]
+  },
+  "synthetic_codex_switch.jsonl": {
+    "context": [
+      {
+        "cached_input_context_tokens": 0,
+        "compaction_phase": null,
+        "event_id": "4ff3c23c618b36ba904d5805c139edfdaa989f8f73a6406784dca655b78d732b",
+        "event_kind": "normal",
+        "input_context_tokens": 100,
+        "model_context_window": 200000,
+        "observed_at": "2026-10-02T00:00:02.000000Z",
+        "provider": "codex",
+        "run_id": "switch-1",
+        "source_event_id": null
+      },
+      {
+        "cached_input_context_tokens": 40,
+        "compaction_phase": null,
+        "event_id": "49fbb3ea2c2d93c7d337e2ae1f672434f825169c0fd1fee4b3cd322430da1fe9",
+        "event_kind": "normal",
+        "input_context_tokens": 50,
+        "model_context_window": 200000,
+        "observed_at": "2026-10-02T00:00:04.000000Z",
+        "provider": "codex",
+        "run_id": "switch-1",
+        "source_event_id": null
+      },
+      {
+        "cached_input_context_tokens": null,
+        "compaction_phase": "marker",
+        "event_id": "ee92a6c9e4248fc4e75743a022a88ee3767477d79681fdde2a6e76b67465201b",
+        "event_kind": "compaction",
+        "input_context_tokens": 1000,
+        "model_context_window": null,
+        "observed_at": "2026-10-02T00:00:06.000000Z",
+        "provider": "codex",
+        "run_id": "switch-1",
+        "source_event_id": null
+      }
+    ],
+    "provider": "codex",
+    "runs": [
+      {
+        "ended_at": null,
+        "model": "gpt-6",
+        "parent_run_id": null,
+        "provider": "codex",
+        "root_run_id": "switch-1",
+        "run_id": "switch-1",
+        "run_kind": "root",
+        "started_at": "2026-10-02T00:00:00.000000Z",
+        "status": "completed"
+      }
+    ],
+    "usage": [
+      {
+        "cache_read_input_tokens": 30,
+        "cache_write_input_tokens": null,
+        "event_id": "879d8fcb200afc2c8aa735ab66190e4b20a48766ee0021c1990e8e55d164fb53",
+        "input_tokens": 60,
+        "observed_at": "2026-10-02T00:00:05.000000Z",
+        "output_tokens": 6,
+        "provider": "codex",
+        "reasoning_output_tokens": null,
+        "run_id": "switch-1",
+        "source_event_id": "r1",
+        "total_tokens": 66
+      }
+    ]
+  }
+}

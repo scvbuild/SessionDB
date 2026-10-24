@@ -24,8 +24,10 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unicodedata
+import urllib.parse
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -35,14 +37,31 @@ from typing import Any, Callable, Iterable, Iterator
 
 import zstandard as zstd
 
+import token_usage
 
-ADAPTER_VERSION = {"claude": "claude-v7", "codex": "codex-v10"}
-SCHEMA_VERSION = "10"
+
+ADAPTER_VERSION = {"claude": "claude-v8", "codex": "codex-v11"}
+SCHEMA_VERSION = "12"
+V11_SCHEMA_VERSION = "11"
+V10_SCHEMA_VERSION = "10"
 RETRIEVAL_PROTOCOL_VERSION = 1
 PROJECTION_VERSION = "redacted-column-fts-v15"
 PROJECTION_INTEGRITY_RECEIPT_SCHEMA = "sessiondb-projection-integrity-receipt-v1"
 PROJECTION_INTEGRITY_RECEIPT_NAME = "projection-integrity-receipt.json"
 COMPRESSION = "zstd"
+BLOCK_COMPRESSION = "zstd-block"
+# Verified copies group live objects into solid blocks in pack order: objects under
+# SMALL_OBJECT_MAX_BYTES into blocks of about OBJECT_BLOCK_TARGET_BYTES, larger ones into blocks of
+# about LARGE_OBJECT_BLOCK_TARGET_BYTES (near-duplicate large outputs compress against each other),
+# and objects of SINGLE_OBJECT_MIN_BYTES or more stay single frames. Reads decompress only the
+# block prefix they need, through a bounded cache of decompressed blocks.
+OBJECT_BLOCK_TARGET_BYTES = 1024 * 1024
+SMALL_OBJECT_MAX_BYTES = 128 * 1024
+LARGE_OBJECT_BLOCK_TARGET_BYTES = 16 * 1024 * 1024
+SINGLE_OBJECT_MIN_BYTES = 64 * 1024 * 1024
+OBJECT_BLOCK_LEVEL = 19
+OBJECT_BLOCK_CACHE_MAX_BYTES = 32 * 1024 * 1024
+RETRIEVAL_COPY_LEVEL = 19
 ZSTD_LEVEL = 10
 MIN_SHARED_TEXT_BYTES = 512
 REF_KEY = "$sessiondb_ref"
@@ -65,11 +84,15 @@ CLAUDE_TYPES = {
     "last-prompt", "file-history-snapshot", "progress", "tool_use", "tool_result",
     "custom-title", "attachment", "mode", "file-history-delta", "frame-link",
     "bridge-session", "relocated", "worktree-state", "cost-state",
+    "api-request", "api-request-blob", "api-request-shape",
 }
 CLAUDE_ARTIFACT_TYPES = {
     "artifact-comment-monitor", "artifact-autoreact-ledger",
 }
 CODEX_SESSION_INDEX_NAME = "session_index.jsonl"
+# Cloud Claude sessions have no local transcript; `full_corpus.py import-cloud` writes
+# converted copies under <sessiondb home>/cloud-threads/<project>/<session>.jsonl.
+CLOUD_THREADS_DIR_NAME = "cloud-threads"
 CODEX_TYPES = {
     "session_meta", "event_msg", "response_item", "turn_context", "world_state",
     "compacted", "ghost_snapshot", "thread_rolled_back", "inter_agent_communication_metadata",
@@ -83,7 +106,7 @@ CODEX_PAYLOAD_TYPES = {
     "mcp_tool_call", "mcp_tool_call_output", "image_generation_call",
     "agent_reasoning", "thread_settings_applied", "web_search_end", "patch_apply_end",
     "sub_agent_activity", "mcp_tool_call_end", "tool_search_call", "tool_search_output",
-    "image_generation_end", "item_completed", "compaction",
+    "image_generation_end", "item_completed", "compaction", "additional_tools",
 }
 CODEX_REALTIME_PAYLOAD_TYPES = frozenset({
     "transcript_segment", "bem_item_promoted", "realtime_session_closed",
@@ -126,6 +149,10 @@ ADAPTER_MIGRATIONS = {
     ("claude", "claude-v6", "claude-v7"): AdapterMigration(
         "metadata-only", frozenset({"cost-state"}),
     ),
+    ("claude", "claude-v7", "claude-v8"): AdapterMigration(
+        "category-scoped", frozenset({"api-request", "api-request-blob", "api-request-shape"}),
+        unsupported_only=True,
+    ),
     ("codex", "codex-v4", "codex-v5"): AdapterMigration(
         "category-scoped", frozenset({"item_completed"}),
     ),
@@ -167,6 +194,26 @@ ADAPTER_MIGRATIONS = {
     ),
     ("codex", "codex-v9", "codex-v10"): AdapterMigration(
         "category-scoped", frozenset({"compaction"}), unsupported_only=True,
+    ),
+    ("codex", "codex-v6", "codex-v11"): AdapterMigration(
+        "category-scoped",
+        frozenset({"item_completed", "compaction", "additional_tools"}) | CODEX_REALTIME_PAYLOAD_TYPES,
+        unsupported_only=True,
+    ),
+    ("codex", "codex-v7", "codex-v11"): AdapterMigration(
+        "category-scoped",
+        frozenset({"item_completed", "compaction", "additional_tools"}) | CODEX_REALTIME_PAYLOAD_TYPES,
+        unsupported_only=True,
+    ),
+    ("codex", "codex-v8", "codex-v11"): AdapterMigration(
+        "category-scoped", frozenset({"item_completed", "compaction", "additional_tools"}),
+        unsupported_only=True,
+    ),
+    ("codex", "codex-v9", "codex-v11"): AdapterMigration(
+        "category-scoped", frozenset({"compaction", "additional_tools"}), unsupported_only=True,
+    ),
+    ("codex", "codex-v10", "codex-v11"): AdapterMigration(
+        "category-scoped", frozenset({"additional_tools"}), unsupported_only=True,
     ),
 }
 REDACTION_RULES = (
@@ -220,6 +267,8 @@ SEARCH_DEADLINE_SECONDS = 30.0
 # Readers wait out a watcher commit instead of failing after one second; the wait
 # is charged to the caller's search deadline.
 READER_LOCK_WAIT_SECONDS = 10.0
+# A WAL file grows while a long read prevents checkpoints from restarting it; trim it afterwards.
+WAL_JOURNAL_SIZE_LIMIT = 64 * 1024 * 1024
 # Agents read inline output directly; larger clean-query answers go to a private file.
 QUERY_INLINE_MAX_BYTES = 64 * 1024
 QUERY_PREVIEW_OBJECT_CHARS = 2000
@@ -272,44 +321,71 @@ AUTO_METADATA_ALLOWED_SUFFIXES = (
 SCHEMA = """
 PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS objects (
-  object_hash TEXT PRIMARY KEY, kind TEXT NOT NULL, raw_bytes INTEGER NOT NULL,
-  stored_bytes INTEGER NOT NULL, stored_hash TEXT NOT NULL,
-  pack_offset INTEGER NOT NULL, compressed_bytes INTEGER NOT NULL,
-  compression TEXT NOT NULL
+-- Solid Zstandard blocks of whole objects in the object pack. A 'zstd-block' object is the byte
+-- range [block_offset, block_offset+stored_bytes) of one decompressed block.
+CREATE TABLE IF NOT EXISTS object_blocks (
+  block_key INTEGER PRIMARY KEY,
+  pack_offset INTEGER NOT NULL, compressed_bytes INTEGER NOT NULL, raw_bytes INTEGER NOT NULL,
+  compressed_hash BLOB NOT NULL CHECK(length(compressed_hash)=32),
+  block_digest BLOB NOT NULL CHECK(length(block_digest)=32)
 );
+-- `compression` names each object's codec: 'zstd' is one frame at pack_offset, 'zstd-block' a
+-- member of block_key. stored_hash is NULL when it equals object_hash.
+CREATE TABLE IF NOT EXISTS objects (
+  object_hash BLOB PRIMARY KEY CHECK(length(object_hash)=32), kind TEXT NOT NULL,
+  raw_bytes INTEGER NOT NULL, stored_bytes INTEGER NOT NULL,
+  stored_hash BLOB CHECK(stored_hash IS NULL OR length(stored_hash)=32),
+  compression TEXT NOT NULL, pack_offset INTEGER, compressed_bytes INTEGER,
+  block_key INTEGER REFERENCES object_blocks(block_key), block_offset INTEGER
+) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS object_references (
-  parent_hash TEXT NOT NULL REFERENCES objects(object_hash) ON DELETE CASCADE,
-  ordinal INTEGER NOT NULL, child_hash TEXT NOT NULL REFERENCES objects(object_hash),
+  parent_hash BLOB NOT NULL REFERENCES objects(object_hash) ON DELETE CASCADE,
+  ordinal INTEGER NOT NULL, child_hash BLOB NOT NULL REFERENCES objects(object_hash),
   purpose TEXT NOT NULL,
   PRIMARY KEY(parent_hash, ordinal)
 ) WITHOUT ROWID;
+-- Trained Zstandard dictionaries, by purpose ('structure'). Rows are never changed or deleted
+-- while anything references them; a newer dictionary applies only to data written after it.
+CREATE TABLE IF NOT EXISTS compression_dictionaries (
+  dict_id INTEGER PRIMARY KEY, purpose TEXT NOT NULL, dictionary BLOB NOT NULL,
+  dictionary_hash BLOB NOT NULL CHECK(length(dictionary_hash)=32), created_at TEXT NOT NULL
+);
+-- structure_zstd is one Zstandard frame, compressed with dictionary structure_dict_id when set.
 CREATE TABLE IF NOT EXISTS sources (
-  source_id TEXT PRIMARY KEY, provider TEXT NOT NULL, path TEXT NOT NULL UNIQUE,
+  source_key INTEGER PRIMARY KEY,
+  source_id TEXT NOT NULL UNIQUE, provider TEXT NOT NULL, path TEXT NOT NULL UNIQUE,
   size_bytes INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, source_hash TEXT NOT NULL,
   adapter_version TEXT NOT NULL, status TEXT NOT NULL, issue_count INTEGER NOT NULL DEFAULT 0,
-  structure_raw_bytes INTEGER NOT NULL, structure_zstd BLOB NOT NULL
+  structure_raw_bytes INTEGER NOT NULL, structure_zstd BLOB NOT NULL,
+  structure_dict_id INTEGER REFERENCES compression_dictionaries(dict_id)
 );
 CREATE TABLE IF NOT EXISTS sessions (
   session_id TEXT NOT NULL, provider TEXT NOT NULL, project TEXT, parent_session_id TEXT,
   root_session_id TEXT, source_id TEXT NOT NULL REFERENCES sources(source_id),
   PRIMARY KEY(provider, session_id, source_id)
 );
+-- event_rowid is the stable row identity shared with the search index and projection references;
+-- an explicit INTEGER PRIMARY KEY keeps it across VACUUM. Hashes are 32-byte blobs; queries
+-- read them through EVENT_COLUMNS as lowercase hex.
 CREATE TABLE IF NOT EXISTS events (
-  event_id TEXT PRIMARY KEY, source_id TEXT NOT NULL REFERENCES sources(source_id),
+  event_rowid INTEGER PRIMARY KEY,
+  event_id BLOB NOT NULL UNIQUE CHECK(length(event_id)=32),
+  source_key INTEGER NOT NULL REFERENCES sources(source_key),
   provider TEXT NOT NULL, session_id TEXT NOT NULL, project TEXT, sequence INTEGER NOT NULL,
   timestamp TEXT, timestamp_utc TEXT, order_timestamp TEXT, order_kind TEXT NOT NULL,
   category TEXT NOT NULL, role TEXT, tool TEXT, tool_event INTEGER NOT NULL,
   parent_session_id TEXT,
-  raw_hash TEXT NOT NULL, content_hash TEXT, content_shape TEXT, supported INTEGER NOT NULL,
+  raw_hash BLOB NOT NULL CHECK(length(raw_hash)=32),
+  content_hash BLOB CHECK(content_hash IS NULL OR length(content_hash)=32),
+  content_shape TEXT, supported INTEGER NOT NULL,
   structure_offset INTEGER NOT NULL, structure_bytes INTEGER NOT NULL,
   issue TEXT, line_number INTEGER NOT NULL,
-  UNIQUE(source_id, line_number)
+  UNIQUE(source_key, line_number)
 );
 CREATE TABLE IF NOT EXISTS event_content (
-  event_id TEXT NOT NULL REFERENCES events(event_id) ON DELETE CASCADE,
-  ordinal INTEGER NOT NULL, object_hash TEXT NOT NULL REFERENCES objects(object_hash),
-  PRIMARY KEY(event_id, ordinal)
+  event_rowid INTEGER NOT NULL REFERENCES events(event_rowid) ON DELETE CASCADE,
+  ordinal INTEGER NOT NULL, object_hash BLOB NOT NULL REFERENCES objects(object_hash),
+  PRIMARY KEY(event_rowid, ordinal)
 ) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS adapter_extensions (
   provider TEXT NOT NULL, category TEXT NOT NULL, structural_signature TEXT NOT NULL,
@@ -344,15 +420,55 @@ CREATE TABLE IF NOT EXISTS search_projection_refs (
 CREATE INDEX IF NOT EXISTS events_count_idx ON events(supported);
 CREATE INDEX IF NOT EXISTS search_projection_refs_block_idx ON search_projection_refs(block_key);
 -- Session titles: only the title records, so a lookup reads the latest without scanning a session.
-CREATE INDEX IF NOT EXISTS events_title_idx ON events(source_id, session_id, order_timestamp)
+CREATE INDEX IF NOT EXISTS events_title_idx ON events(source_key, session_id, order_timestamp)
   WHERE category IN ('ai-title','custom-title','thread_name');
 -- Record times: a --since/--until search keeps only the window's matches before reading them.
 CREATE INDEX IF NOT EXISTS events_time_idx ON events(order_timestamp);
+-- Source watermarks: every command's freshness and snapshot checks scan these columns, and a
+-- covering index keeps those scans off the rows that carry structure bundles.
+CREATE INDEX IF NOT EXISTS sources_watermark_idx ON sources(
+  provider, source_id, source_hash, size_bytes, mtime_ns, adapter_version, status, issue_count, path
+);
 CREATE TRIGGER IF NOT EXISTS events_projection_bd BEFORE DELETE ON events BEGIN
   DELETE FROM positional_projection_fts WHERE rowid=old.rowid;
   DELETE FROM search_projection_refs WHERE event_rowid=old.rowid;
 END;
 """
+# New databases use 8 KiB pages: at 4 KiB, VACUUM leaves FTS5 leaf rows (about 4 KiB each) on
+# mostly empty pages.
+PAGE_SIZE = 8192
+
+# Event rows as the serving code reads them: hashes as lowercase hex and the source's identity,
+# from `events e` joined to `sources src` (EVENT_JOIN).
+EVENT_COLUMNS = (
+    "e.event_rowid AS event_rowid,lower(hex(e.event_id)) AS event_id,src.source_id AS source_id,"
+    "e.provider AS provider,e.session_id AS session_id,e.project AS project,e.sequence AS sequence,"
+    "e.timestamp AS timestamp,e.timestamp_utc AS timestamp_utc,e.order_timestamp AS order_timestamp,"
+    "e.order_kind AS order_kind,e.category AS category,e.role AS role,e.tool AS tool,"
+    "e.tool_event AS tool_event,e.parent_session_id AS parent_session_id,"
+    "lower(hex(e.raw_hash)) AS raw_hash,nullif(lower(hex(e.content_hash)),'') AS content_hash,"
+    "e.content_shape AS content_shape,e.supported AS supported,"
+    "e.structure_offset AS structure_offset,e.structure_bytes AS structure_bytes,"
+    "e.issue AS issue,e.line_number AS line_number"
+)
+EVENT_JOIN = "events e JOIN sources src ON src.source_key=e.source_key"
+# The source_key of one source_id, for index-backed `e.source_key=` lookups.
+SOURCE_KEY_OF = "(SELECT source_key FROM sources WHERE source_id=?)"
+OBJECT_COLUMNS = (
+    "lower(hex(object_hash)) AS object_hash,kind,raw_bytes,stored_bytes,"
+    "lower(hex(coalesce(stored_hash,object_hash))) AS stored_hash,compression,pack_offset,"
+    "compressed_bytes,block_key,block_offset"
+)
+
+
+def hex_blob(value: str | None) -> bytes | None:
+    """32-byte storage form of a lowercase hex digest."""
+    if value is None:
+        return None
+    result = bytes.fromhex(value)
+    if len(result) != 32:
+        raise ValueError("digest must contain 32 bytes")
+    return result
 
 
 def digest(data: bytes) -> str:
@@ -1172,9 +1288,11 @@ def accent_phrase_tokens(text: str) -> list[str]:
 
 def project_from_path(path: Path) -> str | None:
     parts = path.parts
-    if ".claude" in parts and "projects" in parts:
-        index = parts.index("projects")
-        return parts[index + 1] if index + 1 < len(parts) else None
+    for index in range(len(parts) - 2):
+        if parts[index] == ".claude" and parts[index + 1] == "projects":
+            return parts[index + 2]
+        if parts[index] in {"sessiondb", "sessiondb-public"} and parts[index + 1] == CLOUD_THREADS_DIR_NAME:
+            return parts[index + 2]
     return None
 
 
@@ -1311,7 +1429,10 @@ def codex_content(
             key for key in ("content", "message", "summary", "arguments", "output", "input", "last_agent_message")
             if payload.get(key) is not None
         ), None)
-    if primary_key is None and payload_type == "tool_search_output" and payload.get("tools") is not None:
+    if (
+        primary_key is None and payload_type in {"tool_search_output", "additional_tools"}
+        and payload.get("tools") is not None
+    ):
         primary_key = "tools"
     if primary_key is not None:
         content = payload[primary_key]
@@ -1501,168 +1622,85 @@ def _path_identity(path: Path) -> tuple[int, int] | None:
     return value.st_dev, value.st_ino
 
 
-def _migrate_projection_storage_v9_to_v10_locked(db: sqlite3.Connection) -> None:
-    block_columns = {
-        row[1] for row in db.execute("PRAGMA table_info(search_projection_blocks)")
-    }
-    ref_columns = {
-        row[1] for row in db.execute("PRAGMA table_info(search_projection_refs)")
-    }
-    if not block_columns and not ref_columns:
-        db.execute(
-            "UPDATE metadata SET value=? WHERE key='schema_version'", (SCHEMA_VERSION,),
-        )
-        db.commit()
-        return
-    if "block_key" in block_columns:
-        db.execute(
-            "UPDATE metadata SET value=? WHERE key='schema_version'", (SCHEMA_VERSION,),
-        )
-        db.commit()
-        return
-    if "block_id" not in block_columns or "block_id" not in ref_columns:
-        raise ValueError("schema v9 projection storage is incomplete; rebuild required")
-    def unhex_digest(value: str | None) -> bytes | None:
-        if value is None:
-            return None
-        result = bytes.fromhex(value)
-        if len(result) != 32:
-            raise ValueError("projection digest must contain 32 bytes")
-        return result
+# Set only by the v11-to-v12 migration (rebuild_copy.migration_open), which opens its own private copy.
+_MIGRATION_OPEN = threading.local()
 
-    compressed_hashes: dict[str, bytes] = {}
-    needs_compressed_hashes = (
-        "compressed_hash" not in block_columns
-        or db.execute(
-            "SELECT EXISTS(SELECT 1 FROM search_projection_blocks "
-            "WHERE compressed_hash IS NULL)"
-        ).fetchone()[0]
-    )
-    if needs_compressed_hashes:
-        projection_pack = projection_pack_path(db)
-        with projection_pack.open("rb") as handle:
-            for row in db.execute(
-                "SELECT block_id,pack_offset,compressed_bytes "
-                "FROM search_projection_blocks ORDER BY pack_offset,block_id"
-            ):
-                handle.seek(row["pack_offset"])
-                compressed = handle.read(row["compressed_bytes"])
-                if len(compressed) != row["compressed_bytes"]:
-                    raise ValueError(f"projection block extent missing: {row['block_id']}")
-                compressed_hashes[row["block_id"]] = digest_bytes(compressed)
 
-    def compressed_hash(block_id: str) -> bytes:
+def read_only_uri(path: Path | str) -> str:
+    """SQLite URI that opens path read-only; percent-encoding keeps ?, # and % inside the path."""
+    ensure_wal_side_files(path)
+    return "file:" + urllib.parse.quote(str(path)) + "?mode=ro"
+
+
+def _file_format_is_wal(path: Path) -> bool:
+    try:
+        with path.open("rb") as handle:
+            header = handle.read(20)
+    except OSError:
+        return False
+    return header[18:20] == b"\x02\x02"  # SQLite file format bytes: 2 means WAL
+
+
+def ensure_wal_side_files(path: Path | str) -> None:
+    """Recreate a WAL database's -wal and -shm files so a read-only open can succeed.
+
+    Apple's SQLite cannot open a WAL database read-only without them, and other SQLite builds
+    (python.org Python) delete them when their last read-write connection closes. Best effort:
+    a failure leaves the read-only open to report its own error.
+    """
+    path = Path(path)
+    if Path(str(path) + "-wal").exists() and Path(str(path) + "-shm").exists():
+        return
+    if not _file_format_is_wal(path):
+        return
+    try:
+        db = sqlite3.connect(path, timeout=1)
         try:
-            return compressed_hashes[block_id]
-        except KeyError as error:
-            raise ValueError(f"projection block hash unavailable: {block_id}") from error
+            db.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchall()
+        finally:
+            db.close()
+    except sqlite3.Error:
+        pass
 
-    def reference_hash(
-        event_rowid: int, block_id: str, offset: int, size: int, value_hash: str,
-    ) -> bytes:
-        return projection_reference_hash(
-            event_rowid, unhex_digest(block_id), offset, size, unhex_digest(value_hash),
-        )
 
-    db.create_function("sessiondb_unhex", 1, unhex_digest, deterministic=True)
-    db.create_function("sessiondb_compressed_hash", 1, compressed_hash, deterministic=True)
-    db.create_function("sessiondb_reference_hash", 5, reference_hash, deterministic=True)
-    compressed_hash_sql = (
-        "COALESCE(sessiondb_unhex(b.compressed_hash),"
-        "sessiondb_compressed_hash(b.block_id))"
-        if "compressed_hash" in block_columns else
-        "sessiondb_compressed_hash(b.block_id)"
-    )
-    reference_hash_sql = (
-        "COALESCE(sessiondb_unhex(r.reference_hash),sessiondb_reference_hash("
-        "r.event_rowid,r.block_id,r.projection_offset,r.projection_bytes,r.projection_hash))"
-        if "reference_hash" in ref_columns else
-        "sessiondb_reference_hash(r.event_rowid,r.block_id,r.projection_offset,"
-        "r.projection_bytes,r.projection_hash)"
-    )
-    db.execute("PRAGMA foreign_keys=OFF")
+def checkpoint_without_waiting(db: sqlite3.Connection) -> None:
+    """Fold the WAL into the database so closing this connection last changes no file.
+
+    Never waits: while another read is open the checkpoint is skipped, and this connection is
+    then not the last to close, so its close changes nothing either.
+    """
+    timeout = db.execute("PRAGMA busy_timeout").fetchone()[0]
+    db.execute("PRAGMA busy_timeout=0")
     try:
-        db.execute("BEGIN IMMEDIATE")
-        db.execute("DROP TRIGGER IF EXISTS events_projection_bd")
-        statements = (
-            "CREATE TABLE search_projection_block_map ("
-            "block_id TEXT PRIMARY KEY,block_key INTEGER NOT NULL UNIQUE) WITHOUT ROWID",
-            "INSERT INTO search_projection_block_map(block_id,block_key) "
-            "SELECT block_id,row_number() OVER (ORDER BY pack_offset,block_id) "
-            "FROM search_projection_blocks",
-            "CREATE TABLE search_projection_blocks_v10 ("
-            "block_key INTEGER PRIMARY KEY,block_digest BLOB NOT NULL UNIQUE "
-            "CHECK(length(block_digest)=32),"
-            "pack_offset INTEGER NOT NULL,compressed_bytes INTEGER NOT NULL,"
-            "raw_bytes INTEGER NOT NULL,compressed_hash BLOB NOT NULL "
-            "CHECK(length(compressed_hash)=32))",
-            "INSERT INTO search_projection_blocks_v10 "
-            "SELECT m.block_key,sessiondb_unhex(b.block_id),b.pack_offset,"
-            f"b.compressed_bytes,b.raw_bytes,{compressed_hash_sql} "
-            "FROM search_projection_blocks b JOIN search_projection_block_map m USING(block_id)",
-            "CREATE TABLE search_projection_refs_v10 ("
-            "event_rowid INTEGER PRIMARY KEY,block_key INTEGER NOT NULL "
-            "REFERENCES search_projection_blocks(block_key),projection_offset INTEGER NOT NULL,"
-            "projection_bytes INTEGER NOT NULL,projection_hash BLOB NOT NULL "
-            "CHECK(length(projection_hash)=32),reference_hash BLOB NOT NULL "
-            "CHECK(length(reference_hash)=32)) WITHOUT ROWID",
-            "INSERT INTO search_projection_refs_v10 "
-            "SELECT r.event_rowid,m.block_key,r.projection_offset,r.projection_bytes,"
-            f"sessiondb_unhex(r.projection_hash),{reference_hash_sql} "
-            "FROM search_projection_refs r JOIN search_projection_block_map m USING(block_id)",
-        )
-        for statement in statements:
-            db.execute(statement)
-        old_count = db.execute("SELECT COUNT(*) FROM search_projection_refs").fetchone()[0]
-        new_count = db.execute("SELECT COUNT(*) FROM search_projection_refs_v10").fetchone()[0]
-        if old_count != new_count:
-            raise ValueError(f"projection reference migration lost rows: {old_count} != {new_count}")
-        mismatches = db.execute(
-            "SELECT COUNT(*) FROM search_projection_refs r "
-            "JOIN search_projection_block_map m USING(block_id) "
-            "JOIN search_projection_refs_v10 n USING(event_rowid) "
-            "JOIN search_projection_blocks_v10 b ON b.block_key=n.block_key "
-            "WHERE n.block_key<>m.block_key OR b.block_digest<>sessiondb_unhex(r.block_id) "
-            "OR n.projection_offset<>r.projection_offset "
-            "OR n.projection_bytes<>r.projection_bytes "
-            "OR n.projection_hash<>sessiondb_unhex(r.projection_hash) "
-            f"OR n.reference_hash<>{reference_hash_sql}"
-        ).fetchone()[0]
-        if mismatches:
-            raise ValueError(f"projection reference migration changed {mismatches} logical rows")
-        for statement in (
-            "DROP TABLE search_projection_refs",
-            "DROP TABLE search_projection_blocks",
-            "ALTER TABLE search_projection_blocks_v10 RENAME TO search_projection_blocks",
-            "ALTER TABLE search_projection_refs_v10 RENAME TO search_projection_refs",
-            "DROP TABLE search_projection_block_map",
-        ):
-            db.execute(statement)
-        db.execute("""
-            CREATE TRIGGER events_projection_bd BEFORE DELETE ON events BEGIN
-              DELETE FROM positional_projection_fts WHERE rowid=old.rowid;
-              DELETE FROM search_projection_refs WHERE event_rowid=old.rowid;
-            END
-        """)
-        db.execute("UPDATE metadata SET value=? WHERE key='schema_version'", (SCHEMA_VERSION,))
-        foreign_key_failures = db.execute("PRAGMA foreign_key_check").fetchall()
-        if foreign_key_failures:
-            raise ValueError("projection storage migration created invalid references")
-        db.commit()
-    except Exception:
-        db.rollback()
-        raise
+        db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
     finally:
-        db.execute("PRAGMA foreign_keys=ON")
+        db.execute(f"PRAGMA busy_timeout={timeout}")
 
 
-def migrate_projection_storage_v9_to_v10(db: sqlite3.Connection) -> None:
-    """Compact projection references without rebuilding FTS rows or the retrieval pack."""
-    lease = acquire_projection_pack_lease(db, exclusive=True)
+def enable_wal(path: Path, timeout: float = 5.0) -> str:
+    """Put a store in WAL mode so long readers and the writer never block each other.
+
+    Returns the journal mode afterwards. The switch needs a moment with no open read; when one
+    is open the store stays as it is and the next call retries.
+    """
+    # Opening a connection to check would checkpoint on close and void the integrity receipt.
+    if _file_format_is_wal(path):
+        ensure_wal_side_files(path)
+        return "wal"
+    db = sqlite3.connect(path, timeout=timeout)
     try:
-        _migrate_projection_storage_v9_to_v10_locked(db)
+        mode = db.execute("PRAGMA journal_mode").fetchone()[0]
+        if mode != "wal":
+            try:
+                mode = db.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc) and "busy" not in str(exc):
+                    raise
     finally:
-        release_projection_pack_lease(lease)
+        db.close()
+    # The connection that switches the mode deletes the side files when it closes.
+    ensure_wal_side_files(path)
+    return mode
 
 
 def connect(path: Path, *, read_only: bool = False, timeout: float = 60.0) -> sqlite3.Connection:
@@ -1671,7 +1709,7 @@ def connect(path: Path, *, read_only: bool = False, timeout: float = 60.0) -> sq
         before = _path_identity(resolved)
         if read_only:
             db = sqlite3.connect(
-                f"file:{resolved}?mode=ro", timeout=timeout, uri=True, factory=SessionConnection,
+                read_only_uri(resolved), timeout=timeout, uri=True, factory=SessionConnection,
             )
         else:
             db = sqlite3.connect(resolved, timeout=timeout, factory=SessionConnection)
@@ -1685,6 +1723,8 @@ def connect(path: Path, *, read_only: bool = False, timeout: float = 60.0) -> sq
             raise RuntimeError(f"database path changed while opening: {resolved}")
     db.row_factory = sqlite3.Row
     db.execute(f"PRAGMA busy_timeout={max(0, int(timeout * 1000))}")
+    if not read_only:
+        db.execute(f"PRAGMA journal_size_limit={WAL_JOURNAL_SIZE_LIMIT}")
     tables = {
         row[0] for row in db.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
@@ -1700,16 +1740,31 @@ def connect(path: Path, *, read_only: bool = False, timeout: float = 60.0) -> sq
         db.close()
         raise ValueError("unversioned database detected; refusing to modify it")
     if version and version[0] == "9":
-        if read_only:
-            db.close()
-            raise ValueError("SessionDB schema v9 requires a one-time writer migration to v10")
-        migrate_projection_storage_v9_to_v10(db)
-        version = (SCHEMA_VERSION,)
-    if version and version[0] != SCHEMA_VERSION:
+        db.close()
+        raise ValueError(
+            "SessionDB schema v9 is no longer supported: open it once with a schema v10 release, "
+            "then run `full_corpus.py migrate-storage`"
+        )
+    if version and version[0] == V10_SCHEMA_VERSION:
+        db.close()
+        raise ValueError(
+            "SessionDB schema v10 must be migrated into a verified v11 copy: run "
+            "`full_corpus.py migrate-storage --db <current> --target-db <copy>`, then promote the copy"
+        )
+    if version and version[0] == V11_SCHEMA_VERSION and not getattr(_MIGRATION_OPEN, "allowed", False):
+        db.close()
+        raise ValueError(
+            "SessionDB schema v11 must be migrated into a verified v12 copy: run "
+            "`full_corpus.py rebuild-into-copy --db <current> --target-db <copy>`, then promote the copy"
+        )
+    if version and version[0] not in (SCHEMA_VERSION, V11_SCHEMA_VERSION):
         db.close()
         raise ValueError(f"unsupported SessionDB schema version: {version[0]}")
     if not read_only:
+        if not tables:
+            db.execute(f"PRAGMA page_size={PAGE_SIZE}")
         db.executescript(SCHEMA)
+        token_usage.ensure_schema(db)
         projection_columns = {
             row[1] for row in db.execute("PRAGMA table_info(positional_projection_fts)")
         }
@@ -1900,7 +1955,7 @@ def put_packed_object(
     raw_bytes: int | None = None, pack_handle: Any | None = None,
 ) -> str:
     object_hash = object_hash or digest(data)
-    if db.execute("SELECT 1 FROM objects WHERE object_hash=?", (object_hash,)).fetchone():
+    if db.execute("SELECT 1 FROM objects WHERE object_hash=unhex(?)", (object_hash,)).fetchone():
         return object_hash
     compressed = zstd.compress(data, level=ZSTD_LEVEL)
     path = pack_path(db)
@@ -1912,10 +1967,13 @@ def put_packed_object(
         with path.open("ab") as handle:
             handle.write(compressed)
             handle.flush()
+    stored_hash = digest(data)
     db.execute(
-        "INSERT INTO objects VALUES(?,?,?,?,?,?,?,?)",
-        (object_hash, kind, raw_bytes if raw_bytes is not None else len(data), len(data), digest(data),
-         offset, len(compressed), COMPRESSION),
+        "INSERT INTO objects(object_hash,kind,raw_bytes,stored_bytes,stored_hash,compression,"
+        "pack_offset,compressed_bytes) VALUES(unhex(?),?,?,?,?,?,?,?)",
+        (object_hash, kind, raw_bytes if raw_bytes is not None else len(data), len(data),
+         None if stored_hash == object_hash else hex_blob(stored_hash),
+         COMPRESSION, offset, len(compressed)),
     )
     return object_hash
 
@@ -1987,7 +2045,7 @@ def put_content_object(db: sqlite3.Connection, item: Any, pack_handle: Any | Non
             raw_bytes=len(original), pack_handle=pack_handle,
         )
     object_hash = digest(original)
-    if db.execute("SELECT 1 FROM objects WHERE object_hash=?", (object_hash,)).fetchone():
+    if db.execute("SELECT 1 FROM objects WHERE object_hash=unhex(?)", (object_hash,)).fetchone():
         return object_hash
     put_packed_object(
         db, stored_json(manifest), "manifest", object_hash=object_hash,
@@ -1995,7 +2053,7 @@ def put_content_object(db: sqlite3.Connection, item: Any, pack_handle: Any | Non
     )
     for ordinal, (child_hash, purpose) in enumerate(references):
         db.execute(
-            "INSERT INTO object_references VALUES(?,?,?,?)",
+            "INSERT INTO object_references VALUES(unhex(?),?,unhex(?),?)",
             (object_hash, ordinal, child_hash, purpose),
         )
     return object_hash
@@ -2032,6 +2090,17 @@ def parsed_structure(
     return stored_json(structure)
 
 
+STRUCTURE_OBJECT_RE = re.compile(rb'\{"\$sessiondb_event_object":"([0-9a-f]{64})"\}')
+
+
+def structure_object_hashes(bundle: bytes) -> set[str]:
+    """Objects an event structure bundle references directly (EVENT_OBJECT_KEY placeholders).
+
+    The placeholder's unescaped quotes cannot occur inside a JSON string, so a byte scan finds
+    exactly the placeholders parsed_structure wrote."""
+    return {match.decode("ascii") for match in STRUCTURE_OBJECT_RE.findall(bundle)}
+
+
 def expand_parsed_structure(
     structure_bytes: bytes, content: Any | None, object_reader: Any,
 ) -> dict[str, Any]:
@@ -2053,6 +2122,82 @@ def expand_parsed_structure(
     if not isinstance(result, dict):
         raise ValueError("parsed event structure is not an object")
     return result
+
+
+STRUCTURE_DICTIONARY_PURPOSE = "structure"
+# Zstandard compressors, decompressors, and open block readers are not thread-safe, so each
+# thread keeps its own; keys carry the database file identity, so a replaced file never reuses them.
+_CODEC_STATE = threading.local()
+
+
+def _codec_state() -> Any:
+    state = _CODEC_STATE
+    if not hasattr(state, "dictionaries"):
+        state.dictionaries = {}
+        state.dictionary_codecs = {}
+        state.blocks = OrderedDict()
+        state.block_bytes = 0
+    return state
+
+
+def _database_identity(db: sqlite3.Connection) -> tuple[Any, ...]:
+    database = db.execute("PRAGMA database_list").fetchone()["file"]
+    identity = getattr(db, "_sessiondb_path_identity", None)
+    if identity is None:
+        try:
+            value = os.stat(database)
+            identity = (value.st_dev, value.st_ino)
+        except OSError:
+            identity = None
+    return (database, identity)
+
+
+def compression_dictionary(db: sqlite3.Connection, dict_id: int) -> Any:
+    """One stored dictionary, verified against its hash and cached per database."""
+    cache = _codec_state().dictionaries
+    key = (_database_identity(db), dict_id)
+    cached = cache.get(key)
+    if cached is None:
+        row = db.execute(
+            "SELECT dictionary,dictionary_hash FROM compression_dictionaries WHERE dict_id=?", (dict_id,),
+        ).fetchone()
+        if not row or digest_bytes(row["dictionary"]) != row["dictionary_hash"]:
+            raise ValueError(f"compression dictionary missing or corrupt: {dict_id}")
+        cached = cache[key] = zstd.ZstdCompressionDict(row["dictionary"])
+    return cached
+
+
+def compress_structure_bundle(db: sqlite3.Connection, data: bytes, level: int = ZSTD_LEVEL) -> tuple[bytes, int | None]:
+    """Compress a structure bundle with the newest structure dictionary, when one exists."""
+    row = db.execute(
+        "SELECT MAX(dict_id) FROM compression_dictionaries WHERE purpose=?", (STRUCTURE_DICTIONARY_PURPOSE,),
+    ).fetchone()
+    dict_id = row[0] if row else None
+    if dict_id is None:
+        return zstd.compress(data, level=level), None
+    return _dictionary_codec(db, dict_id, ("compress", level)).compress(data), dict_id
+
+
+def _dictionary_codec(db: sqlite3.Connection, dict_id: int, role: tuple[str, int]) -> Any:
+    """A reusable compressor or decompressor bound to one dictionary (digested once)."""
+    cache = _codec_state().dictionary_codecs
+    key = (_database_identity(db), dict_id, role)
+    codec = cache.get(key)
+    if codec is None:
+        dictionary = compression_dictionary(db, dict_id)
+        codec = cache[key] = (
+            zstd.ZstdCompressor(level=role[1], dict_data=dictionary) if role[0] == "compress"
+            else zstd.ZstdDecompressor(dict_data=dictionary)
+        )
+    return codec
+
+
+def decompress_structure_bundle(
+    db: sqlite3.Connection, blob: bytes, raw_bytes: int, dict_id: int | None,
+) -> bytes:
+    if dict_id is None:
+        return zstd.decompress(blob, max_output_size=raw_bytes)
+    return _dictionary_codec(db, dict_id, ("decompress", 0)).decompress(blob, max_output_size=raw_bytes)
 
 
 class SourceBoundaryChanged(RuntimeError):
@@ -2145,8 +2290,10 @@ def store_source_lines(
     start_line: int, structure_buffer: bytearray, meta: dict[str, Any], sessions: set[str],
     pack_handle: Any, projection_writer: ProjectionBlockWriter,
     auto_extensions: frozenset[tuple[str, str]] = frozenset(),
+    row_sink: Callable[[int, dict[str, Any]], None] | None = None,
 ) -> tuple[int, int]:
     count = issues = 0
+    source_key = db.execute("SELECT source_key FROM sources WHERE source_id=?", (source_id,)).fetchone()[0]
     for line_number, raw_line in enumerate(io.BytesIO(source_bytes), start_line):
         if not raw_line.strip():
             continue
@@ -2165,20 +2312,25 @@ def store_source_lines(
                 "unreadable_bytes_base64": base64.b64encode(raw_line).decode("ascii"),
             }
             content_hash = put_content_object(db, retained, pack_handle)
-            db.execute(
-                "INSERT INTO events VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (event_id, source_id, provider, path.stem, project_from_path(path), line_number,
+            cursor = db.execute(
+                "INSERT INTO events(event_id,source_key,provider,session_id,project,sequence,timestamp,"
+                "timestamp_utc,order_timestamp,order_kind,category,role,tool,tool_event,parent_session_id,"
+                "raw_hash,content_hash,content_shape,supported,structure_offset,structure_bytes,issue,"
+                "line_number) VALUES(unhex(?),?,?,?,?,?,?,?,?,?,?,?,?,?,?,unhex(?),unhex(?),?,?,?,?,?,?)",
+                (event_id, source_key, provider, path.stem, project_from_path(path), line_number,
                  None, None, None, "file_mtime", "unreadable", None, None, 0, None,
                  raw_hash, content_hash, "dict", 0, len(structure_buffer), len(structure_bytes),
                  str(exc), line_number),
             )
             structure_buffer.extend(structure_bytes)
-            event_rowid = db.execute("SELECT rowid FROM events WHERE event_id=?", (event_id,)).fetchone()[0]
-            db.execute("INSERT INTO event_content VALUES(?,?,?)", (event_id, 0, content_hash))
+            event_rowid = cursor.lastrowid
+            db.execute("INSERT INTO event_content VALUES(?,?,unhex(?))", (event_rowid, 0, content_hash))
             put_search_projection(db, event_rowid, "[REDACTED]", projection_writer)
             issues += 1
             count += 1
             continue
+        if row_sink is not None:
+            row_sink(line_number, row)
         raw_hash = digest(raw)
         parsed = (
             parse_claude(row, path, meta, auto_extensions)
@@ -2198,18 +2350,21 @@ def store_source_lines(
         }
         structure_bytes = parsed_structure(row, parsed.content_paths, extra_hashes)
         timestamp_utc = normalize_timestamp(parsed.timestamp)
-        db.execute(
-            "INSERT INTO events VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (event_id, source_id, provider, parsed.session_id, parsed.project, line_number,
+        cursor = db.execute(
+            "INSERT INTO events(event_id,source_key,provider,session_id,project,sequence,timestamp,"
+            "timestamp_utc,order_timestamp,order_kind,category,role,tool,tool_event,parent_session_id,"
+            "raw_hash,content_hash,content_shape,supported,structure_offset,structure_bytes,issue,"
+            "line_number) VALUES(unhex(?),?,?,?,?,?,?,?,?,?,?,?,?,?,?,unhex(?),unhex(?),?,?,?,?,?,?)",
+            (event_id, source_key, provider, parsed.session_id, parsed.project, line_number,
              parsed.timestamp, timestamp_utc, timestamp_utc, "exact" if timestamp_utc else "pending",
              parsed.category, parsed.role, parsed.tool, int(parsed.tool_event), parsed.parent_id,
              raw_hash, content_hash, content_shape, int(parsed.supported),
              len(structure_buffer), len(structure_bytes), parsed.issue, line_number),
         )
         structure_buffer.extend(structure_bytes)
+        event_rowid = cursor.lastrowid
         for ordinal, object_hash in enumerate(content_parts):
-            db.execute("INSERT INTO event_content VALUES(?,?,?)", (event_id, ordinal, object_hash))
-        event_rowid = db.execute("SELECT rowid FROM events WHERE event_id=?", (event_id,)).fetchone()[0]
+            db.execute("INSERT INTO event_content VALUES(?,?,unhex(?))", (event_rowid, ordinal, object_hash))
         put_search_projection(db, event_rowid, row, projection_writer)
         if parsed.session_id not in sessions:
             db.execute(
@@ -2225,7 +2380,8 @@ def store_source_lines(
 
 def update_source_ordering(db: sqlite3.Connection, source_id: str, stat: Any) -> None:
     exact_rows = db.execute(
-        "SELECT event_id,line_number,timestamp_utc FROM events WHERE source_id=? ORDER BY line_number",
+        "SELECT event_rowid,line_number,timestamp_utc FROM events "
+        f"WHERE source_key={SOURCE_KEY_OF} ORDER BY line_number",
         (source_id,),
     ).fetchall()
     exact_positions = [(row["line_number"], row["timestamp_utc"]) for row in exact_rows if row["timestamp_utc"]]
@@ -2243,8 +2399,8 @@ def update_source_ordering(db: sqlite3.Connection, source_id: str, stat: Any) ->
         else:
             order_timestamp, order_kind = file_time, "file_mtime"
         db.execute(
-            "UPDATE events SET order_timestamp=?,order_kind=? WHERE event_id=?",
-            (order_timestamp, order_kind, event["event_id"]),
+            "UPDATE events SET order_timestamp=?,order_kind=? WHERE event_rowid=?",
+            (order_timestamp, order_kind, event["event_rowid"]),
         )
 
 
@@ -2275,10 +2431,10 @@ def apply_metadata_migration(
         if len(sources) != len(ids) or any(row["adapter_version"] != from_version for row in sources):
             raise ValueError("metadata migration source version mismatch")
         events = db.execute(
-            "SELECT e.*,s.path FROM events e JOIN sources s USING(source_id) "
-            "JOIN sessiondb_migration_sources m USING(source_id) "
+            f"SELECT {EVENT_COLUMNS},src.path FROM {EVENT_JOIN} "
+            "JOIN sessiondb_migration_sources m ON m.source_id=src.source_id "
             f"WHERE e.supported=0 OR e.category IN ({','.join('?' for _ in migration.categories)}) "
-            "ORDER BY e.source_id,e.line_number",
+            "ORDER BY src.source_id,e.line_number",
             tuple(sorted(migration.categories)),
         ).fetchall()
         promoted = 0
@@ -2302,23 +2458,24 @@ def apply_metadata_migration(
                 raise ValueError(f"metadata migration changed event semantics: {event['event_id']}")
             if not event["supported"]:
                 db.execute(
-                    "UPDATE events SET supported=1,issue=NULL WHERE event_id=?", (event["event_id"],),
+                    "UPDATE events SET supported=1,issue=NULL WHERE event_rowid=?", (event["event_rowid"],),
                 )
                 promoted += 1
         db.execute(
             "UPDATE sources SET adapter_version=?,issue_count=("
-            "SELECT COUNT(*) FROM events e WHERE e.source_id=sources.source_id AND e.supported=0) "
+            "SELECT COUNT(*) FROM events e WHERE e.source_key=sources.source_key AND e.supported=0) "
             "WHERE source_id IN (SELECT source_id FROM sessiondb_migration_sources)",
             (to_version,),
         )
         invalid = db.execute(
             "SELECT COUNT(*) FROM sources s JOIN sessiondb_migration_sources m USING(source_id) "
             "WHERE s.adapter_version<>? OR s.issue_count<>("
-            "SELECT COUNT(*) FROM events e WHERE e.source_id=s.source_id AND e.supported=0)",
+            "SELECT COUNT(*) FROM events e WHERE e.source_key=s.source_key AND e.supported=0)",
             (to_version,),
         ).fetchone()[0]
         remaining = db.execute(
-            "SELECT COUNT(*) FROM events e JOIN sessiondb_migration_sources m USING(source_id) "
+            "SELECT COUNT(*) FROM events e JOIN sources src ON src.source_key=e.source_key "
+            "JOIN sessiondb_migration_sources m ON m.source_id=src.source_id "
             f"WHERE e.supported=0 AND e.category IN ({','.join('?' for _ in migration.categories)})",
             tuple(sorted(migration.categories)),
         ).fetchone()[0]
@@ -2359,9 +2516,9 @@ def apply_auto_metadata_admissions(db: sqlite3.Connection) -> dict[str, Any]:
     db.execute("BEGIN IMMEDIATE")
     try:
         rows = db.execute(
-            "SELECT e.*,s.path FROM events e JOIN sources s USING(source_id) "
+            f"SELECT {EVENT_COLUMNS},src.path FROM {EVENT_JOIN} "
             "WHERE e.supported=0 AND e.category<>'unreadable' "
-            "ORDER BY e.provider,e.category,e.source_id,e.line_number"
+            "ORDER BY e.provider,e.category,src.source_id,e.line_number"
         ).fetchall()
         grouped: dict[tuple[str, str], list[sqlite3.Row]] = {}
         for row in rows:
@@ -2410,16 +2567,17 @@ def apply_auto_metadata_admissions(db: sqlite3.Connection) -> dict[str, Any]:
             )
             db.execute(
                 "UPDATE events SET supported=1,issue=NULL "
-                "WHERE event_id IN (SELECT event_id FROM sessiondb_auto_admissions)"
+                "WHERE event_id IN (SELECT unhex(event_id) FROM sessiondb_auto_admissions)"
             )
             db.execute(
                 "UPDATE sources SET issue_count=(SELECT COUNT(*) FROM events e "
-                "WHERE e.source_id=sources.source_id AND e.supported=0) "
-                "WHERE source_id IN (SELECT e.source_id FROM events e "
-                "JOIN sessiondb_auto_admissions a USING(event_id))"
+                "WHERE e.source_key=sources.source_key AND e.supported=0) "
+                "WHERE source_key IN (SELECT e.source_key FROM events e "
+                "JOIN sessiondb_auto_admissions a ON e.event_id=unhex(a.event_id))"
             )
             invalid = db.execute(
-                "SELECT COUNT(*) FROM events e JOIN sessiondb_auto_admissions a USING(event_id) "
+                "SELECT COUNT(*) FROM events e "
+                "JOIN sessiondb_auto_admissions a ON e.event_id=unhex(a.event_id) "
                 "WHERE e.supported<>1 OR e.issue IS NOT NULL"
             ).fetchone()[0]
             if invalid:
@@ -2439,13 +2597,98 @@ def apply_auto_metadata_admissions(db: sqlite3.Connection) -> dict[str, Any]:
     }
 
 
+_SOURCE_STATE_COLUMNS = ("source_key", "source_hash", "size_bytes", "mtime_ns", "status", "adapter_version")
+
+
+def _source_state(row: sqlite3.Row | None) -> tuple[Any, ...] | None:
+    return None if row is None else tuple(row[key] for key in _SOURCE_STATE_COLUMNS)
+
+
+PREFIX_TAIL_BYTES = 4096
+PREFIX_CACHE_LIMIT = 256
+
+
+@dataclass
+class _IndexedPrefix:
+    device: int
+    inode: int
+    size: int
+    source_hash: str
+    hasher: Any
+    newlines: int
+    tail: bytes
+
+
+# Long-lived writers (the freshness watcher) extend the stored SHA-256 with appended bytes
+# instead of rereading and rehashing the whole transcript on every append. Only the last
+# PREFIX_TAIL_BYTES of the indexed prefix are re-read to confirm it still ends where it did.
+# An in-place edit earlier in the file goes unnoticed until the process restarts: the first
+# append after that rehashes the whole prefix and re-imports the file on a mismatch.
+_indexed_prefixes: "OrderedDict[tuple[str, str], _IndexedPrefix]" = OrderedDict()
+
+
+def _remember_indexed_prefix(key: tuple[str, str], state: _IndexedPrefix) -> None:
+    _indexed_prefixes[key] = state
+    _indexed_prefixes.move_to_end(key)
+    while len(_indexed_prefixes) > PREFIX_CACHE_LIMIT:
+        _indexed_prefixes.popitem(last=False)
+
+
+def _cached_append_prefix(
+    key: tuple[str, str], existing: sqlite3.Row | None, provider: str, watermark: Any | None,
+) -> _IndexedPrefix | None:
+    cached = _indexed_prefixes.get(key)
+    if (
+        cached is None or watermark is None or existing is None
+        or existing["adapter_version"] != ADAPTER_VERSION[provider]
+        or existing["status"] != "complete"
+        or (existing["size_bytes"], existing["source_hash"]) != (cached.size, cached.source_hash)
+        or (int(watermark.st_dev), int(watermark.st_ino)) != (cached.device, cached.inode)
+        or int(watermark.st_size) <= cached.size
+        or not cached.tail.endswith(b"\n")
+    ):
+        return None
+    return cached
+
+
+def stable_source_tail(path: Path, watermark: Any, offset: int) -> bytes:
+    """Read bytes [offset, watermark size) under the same boundary rules as a full snapshot."""
+    expected_size = int(watermark.st_size)
+    with path.open("rb") as handle:
+        before = os.fstat(handle.fileno())
+        if (
+            (before.st_dev, before.st_ino) != (watermark.st_dev, watermark.st_ino)
+            or before.st_size < expected_size
+        ):
+            raise SourceBoundaryChanged(f"source changed across sync boundary: {path}")
+        handle.seek(offset)
+        data = handle.read(expected_size - offset)
+        after = os.fstat(handle.fileno())
+    boundary_unchanged = not (
+        before.st_size == expected_size and before.st_mtime_ns != watermark.st_mtime_ns
+    ) and not (
+        after.st_size == expected_size and after.st_mtime_ns != watermark.st_mtime_ns
+    )
+    if (
+        (after.st_dev, after.st_ino) == (watermark.st_dev, watermark.st_ino)
+        and boundary_unchanged and after.st_size >= expected_size
+        and len(data) == expected_size - offset
+    ):
+        return data
+    raise SourceBoundaryChanged(f"source changed across sync boundary: {path}")
+
+
 def ingest(
     db: sqlite3.Connection, provider: str, path: Path,
-    source_watermark: Any | None = None,
+    source_watermark: Any | None = None, *, _retried: bool = False,
 ) -> dict[str, Any]:
+    # A shallow check is enough here: refresh_projection_metadata counts events, indexes and
+    # passages (only the new rows for an append to current metadata) before stamping the
+    # projection current, and each sync's integrity receipt still runs the deep reference check
+    # once. A deep check per ingested file made every append pay a corpus-wide join.
     projection_was_current = (
         db.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
-        or projection_status(db)["complete"]
+        or projection_status(db, deep=False)["complete"]
     )
     resolved = path.resolve()
     initial_stat = source_watermark or resolved.stat()
@@ -2455,14 +2698,40 @@ def ingest(
     if existing and existing["adapter_version"] == ADAPTER_VERSION[provider] and existing["status"] == "complete" and (
         existing["size_bytes"], existing["mtime_ns"]
     ) == (initial_stat.st_size, initial_stat.st_mtime_ns):
-        source_id = existing["source_id"]
-        events = db.execute("SELECT COUNT(*) FROM events WHERE source_id=?", (source_id,)).fetchone()[0]
+        events = db.execute(
+            "SELECT COUNT(*) FROM events WHERE source_key=?", (existing["source_key"],),
+        ).fetchone()[0]
         return {
             "path": str(path), "status": "unchanged", "events": 0,
             "nonblank_lines": events, "issues": existing["issue_count"],
         }
-    stat, source_bytes = stable_source_snapshot(resolved, watermark=source_watermark)
-    source_hash = digest(source_bytes)
+    prefix_key = (db.execute("PRAGMA database_list").fetchone()["file"], str(resolved))
+    cached = _cached_append_prefix(prefix_key, existing, provider, source_watermark)
+    source_bytes = appended = None
+    if cached is not None:
+        read = stable_source_tail(resolved, source_watermark, cached.size - len(cached.tail))
+        if read.startswith(cached.tail):
+            appended = read[len(cached.tail):]
+            stat = source_watermark
+            hasher = cached.hasher.copy()
+            hasher.update(appended)
+        else:
+            _indexed_prefixes.pop(prefix_key, None)
+    if appended is None:
+        stat, source_bytes = stable_source_snapshot(resolved, watermark=source_watermark)
+        hasher = hashlib.sha256(source_bytes)
+    source_hash = hasher.hexdigest()
+    db.execute("BEGIN IMMEDIATE")
+    current = db.execute(
+        "SELECT * FROM sources WHERE provider=? AND path=?", (provider, str(resolved)),
+    ).fetchone()
+    if _source_state(current) != _source_state(existing):
+        # Another writer ingested this source after it was first read; the append and
+        # replace decisions below must rest on the row as it stands under the write lock.
+        db.rollback()
+        if _retried:
+            raise ValueError("source changed during a concurrent ingest; retry later")
+        return ingest(db, provider, path, source_watermark, _retried=True)
     source_id = existing["source_id"] if existing else digest((provider + "\0" + str(resolved)).encode())
     if existing and existing["source_hash"] == source_hash and existing["adapter_version"] == ADAPTER_VERSION[provider]:
         db.execute(
@@ -2473,39 +2742,63 @@ def ingest(
         if projection_was_current:
             refresh_projection_metadata(db)
         db.commit()
-        events = db.execute("SELECT COUNT(*) FROM events WHERE source_id=?", (source_id,)).fetchone()[0]
+        events = db.execute(
+            "SELECT COUNT(*) FROM events WHERE source_key=?", (existing["source_key"],),
+        ).fetchone()[0]
         return {"path": str(path), "status": "unchanged", "events": 0,
                 "nonblank_lines": events, "issues": existing["issue_count"]}
 
     append_state = load_adapter_state(db, source_id) if existing else None
+    if appended is not None and append_state is None:
+        # The cached prefix only shortcuts an append; a full rebuild needs every byte.
+        appended = None
+        stat, source_bytes = stable_source_snapshot(resolved, watermark=source_watermark)
+        hasher = hashlib.sha256(source_bytes)
+        source_hash = hasher.hexdigest()
     append_only = bool(
         existing and append_state is not None
         and existing["adapter_version"] == ADAPTER_VERSION[provider]
         and existing["status"] == "complete"
         and stat.st_size > existing["size_bytes"]
-        and source_bytes[:existing["size_bytes"]].endswith(b"\n")
-        and digest(source_bytes[:existing["size_bytes"]]) == existing["source_hash"]
+        and (appended is not None or (
+            source_bytes[:existing["size_bytes"]].endswith(b"\n")
+            and digest(source_bytes[:existing["size_bytes"]]) == existing["source_hash"]
+        ))
     )
 
-    db.execute("BEGIN IMMEDIATE")
     if append_only:
-        structure_buffer = bytearray(zstd.decompress(
-            existing["structure_zstd"], max_output_size=existing["structure_raw_bytes"],
+        structure_buffer = bytearray(decompress_structure_bundle(
+            db, existing["structure_zstd"], existing["structure_raw_bytes"], existing["structure_dict_id"],
         ))
         meta = append_state
         sessions = {
             row[0] for row in db.execute("SELECT session_id FROM sessions WHERE source_id=?", (source_id,))
         }
-        start_line = source_bytes[:existing["size_bytes"]].count(b"\n") + 1
-        ingest_bytes = source_bytes[existing["size_bytes"]:]
+        if appended is not None:
+            start_line = cached.newlines + 1
+            ingest_bytes = appended
+        else:
+            start_line = source_bytes[:existing["size_bytes"]].count(b"\n") + 1
+            ingest_bytes = source_bytes[existing["size_bytes"]:]
         prior_issues = existing["issue_count"]
+        # Appends receive rowids above the current maximum and delete nothing, so metadata that
+        # is current under this write lock can be extended by counting only the new rows.
+        appended_after = (
+            db.execute("SELECT COALESCE(MAX(event_rowid),0) FROM events").fetchone()[0]
+            if projection_status(db, deep=False)["complete"] else None
+        )
     else:
-        db.execute("DELETE FROM events WHERE source_id=?", (source_id,))
+        if existing:
+            token_usage.reset_source(db, existing["source_key"])
+        db.execute(f"DELETE FROM events WHERE source_key={SOURCE_KEY_OF}", (source_id,))
         db.execute("DELETE FROM sessions WHERE source_id=?", (source_id,))
         db.execute("DELETE FROM sources WHERE source_id=?", (source_id,))
         db.execute(
-            "INSERT INTO sources VALUES(?,?,?,?,?,?,?,?,0,0,?)",
-            (source_id, provider, str(resolved), stat.st_size, stat.st_mtime_ns, source_hash,
+            "INSERT INTO sources(source_key,source_id,provider,path,size_bytes,mtime_ns,source_hash,"
+            "adapter_version,status,issue_count,structure_raw_bytes,structure_zstd) "
+            "VALUES(?,?,?,?,?,?,?,?,?,0,0,?)",
+            (existing["source_key"] if existing else None, source_id, provider, str(resolved),
+             stat.st_size, stat.st_mtime_ns, source_hash,
              ADAPTER_VERSION[provider], "ingesting", zstd.compress(b"", level=ZSTD_LEVEL)),
         )
         structure_buffer = bytearray()
@@ -2518,11 +2811,14 @@ def ingest(
     object_pack.parent.mkdir(parents=True, exist_ok=True)
     search_pack = ensure_projection_pack(db)
     auto_extensions = load_auto_metadata_extensions(db, provider)
+    source_key = db.execute("SELECT source_key FROM sources WHERE source_id=?", (source_id,)).fetchone()[0]
+    tokens = token_usage.SourceProjector(db, provider, source_key, resolved, reset=not append_only)
     with object_pack.open("ab") as pack_handle, search_pack.open("ab") as projection_handle:
         projection_writer = ProjectionBlockWriter(db, projection_handle)
         count, issues = store_source_lines(
             db, provider, resolved, source_id, ingest_bytes, start_line,
             structure_buffer, meta, sessions, pack_handle, projection_writer, auto_extensions,
+            tokens.feed,
         )
         projection_writer.flush()
         pack_handle.flush()
@@ -2530,23 +2826,40 @@ def ingest(
         projection_handle.flush()
         os.fsync(projection_handle.fileno())
     update_source_ordering(db, source_id, stat)
+    token_result = tokens.finish()
     save_adapter_state(db, source_id, persistent_adapter_state(provider, meta))
+    structure_blob, structure_dict_id = compress_structure_bundle(db, bytes(structure_buffer))
     db.execute(
         "UPDATE sources SET size_bytes=?,mtime_ns=?,source_hash=?,adapter_version=?,status='complete',"
-        "issue_count=?,structure_raw_bytes=?,structure_zstd=? "
+        "issue_count=?,structure_raw_bytes=?,structure_zstd=?,structure_dict_id=? "
         "WHERE source_id=?",
         (stat.st_size, stat.st_mtime_ns, source_hash, ADAPTER_VERSION[provider], prior_issues + issues,
-         len(structure_buffer), zstd.compress(bytes(structure_buffer), level=ZSTD_LEVEL), source_id),
+         len(structure_buffer), structure_blob, structure_dict_id, source_id),
     )
     if projection_was_current:
-        refresh_projection_metadata(db)
+        refresh_projection_metadata(db, appended_after=appended_after if append_only else None)
     db.commit()
     clear_caches()
-    total_events = db.execute("SELECT COUNT(*) FROM events WHERE source_id=?", (source_id,)).fetchone()[0]
-    return {
+    if source_watermark is not None:
+        if appended is not None:
+            newlines = cached.newlines + appended.count(b"\n")
+            tail = (cached.tail + appended)[-PREFIX_TAIL_BYTES:]
+        else:
+            newlines = source_bytes.count(b"\n")
+            tail = source_bytes[-PREFIX_TAIL_BYTES:]
+        _remember_indexed_prefix(prefix_key, _IndexedPrefix(
+            int(stat.st_dev), int(stat.st_ino), int(stat.st_size), source_hash, hasher, newlines, tail,
+        ))
+    total_events = db.execute(
+        f"SELECT COUNT(*) FROM events WHERE source_key={SOURCE_KEY_OF}", (source_id,),
+    ).fetchone()[0]
+    result = {
         "path": str(path), "status": "appended" if append_only else "imported", "events": count,
         "nonblank_lines": total_events, "issues": prior_issues + issues,
     }
+    if token_result["status"] == "error":
+        result["token_usage_error"] = token_result["error"]
+    return result
 
 
 def ingest_many(db: sqlite3.Connection, provider: str, paths: Iterable[Path]) -> list[dict[str, Any]]:
@@ -2582,11 +2895,35 @@ def projection_snapshot_id(db: sqlite3.Connection) -> str:
     return digest("\n".join(state).encode())
 
 
-def refresh_projection_metadata(db: sqlite3.Connection) -> str:
+def _projection_counts_after(db: sqlite3.Connection, rowid: int) -> tuple[int, int, int]:
+    return tuple(
+        db.execute(sql, (rowid,)).fetchone()[0] for sql in (
+            "SELECT COUNT(*) FROM events WHERE event_rowid>?",
+            "SELECT COUNT(*) FROM positional_projection_fts WHERE rowid>?",
+            "SELECT COUNT(*) FROM search_projection_refs WHERE event_rowid>?",
+        )
+    )
+
+
+def refresh_projection_metadata(db: sqlite3.Connection, appended_after: int | None = None) -> str:
+    """Stamp projection metadata current; `appended_after` limits counting to rows above that rowid.
+
+    The incremental form is valid only when the stored metadata was current before this
+    transaction and the transaction only inserted events above `appended_after`.
+    """
     snapshot_id = projection_snapshot_id(db)
-    event_count = db.execute("SELECT COUNT(*) FROM events").fetchone()[0]
-    projection_count = db.execute("SELECT COUNT(*) FROM positional_projection_fts").fetchone()[0]
-    passage_count = db.execute("SELECT COUNT(*) FROM search_projection_refs").fetchone()[0]
+    stored = db.execute(
+        "SELECT value FROM metadata WHERE key='projection_event_count'"
+    ).fetchone()
+    if appended_after is not None and stored is not None:
+        added = _projection_counts_after(db, appended_after)
+        event_count = int(stored[0]) + added[0]
+        projection_count = int(stored[0]) + added[1]
+        passage_count = int(stored[0]) + added[2]
+    else:
+        event_count = db.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        projection_count = db.execute("SELECT COUNT(*) FROM positional_projection_fts").fetchone()[0]
+        passage_count = db.execute("SELECT COUNT(*) FROM search_projection_refs").fetchone()[0]
     if event_count != projection_count or event_count != passage_count:
         raise ValueError(
             f"projection count mismatch: {projection_count} indexes and "
@@ -2603,7 +2940,10 @@ def refresh_projection_metadata(db: sqlite3.Connection) -> str:
 
 def projection_status(
     db: sqlite3.Connection, *, pack_available: bool | None = None, deep: bool = True,
+    verified_through: tuple[int, int] | None = None,
 ) -> dict[str, Any]:
+    """`verified_through` = (max event rowid, event count) of an earlier deep check whose rows
+    the caller has proven unchanged since; the deep check then covers only rows above it."""
     expected = projection_snapshot_id(db)
     stored = {
         row["key"]: row["value"] for row in db.execute(
@@ -2612,7 +2952,10 @@ def projection_status(
             "'projection_pack_generation')"
         )
     }
-    if deep:
+    if deep and verified_through is not None:
+        added = _projection_counts_after(db, verified_through[0])
+        event_count, projection_count, passage_count = (verified_through[1] + n for n in added)
+    elif deep:
         event_count = db.execute("SELECT COUNT(*) FROM events").fetchone()[0]
         projection_count = db.execute("SELECT COUNT(*) FROM positional_projection_fts").fetchone()[0]
         passage_count = db.execute("SELECT COUNT(*) FROM search_projection_refs").fetchone()[0]
@@ -2625,9 +2968,10 @@ def projection_status(
         invalid_refs = db.execute(
             "SELECT COUNT(*) FROM search_projection_refs r "
             "LEFT JOIN search_projection_blocks b USING(block_key) "
-            "WHERE b.block_key IS NULL OR r.projection_offset<0 OR r.projection_bytes<0 "
-            "OR r.projection_offset+r.projection_bytes>b.raw_bytes "
-            "OR b.compressed_hash IS NULL OR r.reference_hash IS NULL"
+            "WHERE r.event_rowid>? AND (b.block_key IS NULL OR r.projection_offset<0 "
+            "OR r.projection_bytes<0 OR r.projection_offset+r.projection_bytes>b.raw_bytes "
+            "OR b.compressed_hash IS NULL OR r.reference_hash IS NULL)",
+            (verified_through[0] if verified_through is not None else -1,),
         ).fetchone()[0]
     complete = (
         stored.get("projection_version") == PROJECTION_VERSION
@@ -2656,10 +3000,29 @@ def projection_integrity_receipt_digest(receipt: dict[str, Any]) -> str:
 
 def build_projection_integrity_receipt(
     db: sqlite3.Connection, *, created_at: str | None = None,
+    baseline: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Deep-check one committed generation and describe it without corpus content."""
+    """Deep-check one committed generation and describe it without corpus content.
+
+    `baseline` is an earlier receipt whose rows the caller has proven were only appended to
+    since (see full_corpus.fast_sync); the check then covers only rows added after it.
+    """
     sqlite_before = sqlite_generation_identity(db)
-    status = projection_status(db, pack_available=True, deep=True)
+    pack = projection_pack_path(db)
+    verified_through = None
+    if baseline is not None:
+        previous_pack = baseline["pack"]
+        current_pack = projection_pack_identity(pack)
+        if (
+            previous_pack["generation"] == current_pack["generation"]
+            and (previous_pack["device"], previous_pack["inode"])
+            == (current_pack["device"], current_pack["inode"])
+            and previous_pack["size"] <= current_pack["size"]
+        ):
+            verified_through = (int(baseline["max_event_rowid"]), int(baseline["event_count"]))
+    status = projection_status(
+        db, pack_available=True, deep=True, verified_through=verified_through,
+    )
     if not status["complete"]:
         raise ValueError(f"projection integrity receipt requires a complete index: {status['reason']}")
     stored = {
@@ -2669,7 +3032,7 @@ def build_projection_integrity_receipt(
             "'projection_event_count','projection_pack_generation')"
         )
     }
-    pack = projection_pack_path(db)
+    max_event_rowid = db.execute("SELECT COALESCE(MAX(event_rowid),0) FROM events").fetchone()[0]
     sqlite_after = sqlite_generation_identity(db)
     if sqlite_before != sqlite_after:
         raise ValueError("database generation changed during receipt verification")
@@ -2683,6 +3046,8 @@ def build_projection_integrity_receipt(
         "projection_count": status["projections"],
         "passage_count": status["passages"],
         "invalid_references": status["invalid_references"],
+        "max_event_rowid": max_event_rowid,
+        "verification": "full" if verified_through is None else "since_previous_receipt",
         "sqlite": sqlite_after,
         "pack": projection_pack_identity(pack),
     }
@@ -2750,7 +3115,19 @@ def _projection_status_from_receipt(
         "receipt_created_at": receipt.get("created_at"),
         "_receipt_sha256": expected_digest,
         "_sqlite_generation": receipt["sqlite"],
+        "_receipt": receipt,
     }
+
+
+def projection_receipt_baseline(db: sqlite3.Connection) -> dict[str, Any] | None:
+    """Return the current receipt when it still binds the live files and records its rowid range."""
+    status = _projection_status_from_receipt(db)
+    if status is None:
+        return None
+    receipt = status["_receipt"]
+    if not isinstance(receipt.get("max_event_rowid"), int):
+        return None
+    return receipt
 
 
 def projection_status_from_receipt(
@@ -2927,7 +3304,6 @@ def consume_rebuild_readiness_receipt(
     db: sqlite3.Connection, path: Path, event_count: int,
 ) -> Path:
     receipt = validate_rebuild_readiness_receipt(db, path, event_count)
-    resolved = path.expanduser().absolute()
     ledger = rebuild_receipt_ledger_dir()
     ledger.mkdir(parents=True, exist_ok=True, mode=0o700)
     consumed = rebuild_receipt_consumption_path(receipt["receipt_sha256"])
@@ -2945,17 +3321,22 @@ def consume_rebuild_readiness_receipt(
         handle.flush()
         os.fsync(handle.fileno())
     fsync_directory(ledger)
+    return consumed
+
+
+def discard_consumed_receipt_file(path: Path) -> None:
+    """Remove a receipt file whose digest the ledger already records as consumed."""
+    resolved = path.expanduser().absolute()
     try:
         resolved.unlink()
         fsync_directory(resolved.parent)
     except FileNotFoundError:
         pass
-    return consumed
 
 
 def build_search_projections(
     db: sqlite3.Connection, progress: Callable[[dict[str, Any]], None] | None = None,
-    readiness_receipt: Path | None = None,
+    readiness_receipt: Path | None = None, *, require_receipt: bool = True,
 ) -> dict[str, Any]:
     database = Path(db.execute("PRAGMA database_list").fetchone()["file"])
     lease = acquire_projection_pack_lease(db, exclusive=True)
@@ -2965,7 +3346,9 @@ def build_search_projections(
     try:
         db.execute("BEGIN IMMEDIATE")
         event_count = db.execute("SELECT COUNT(*) FROM events").fetchone()[0]
-        if event_count >= FULL_REBUILD_RECEIPT_MIN_EVENTS:
+        # A private copy is discarded if its build fails and is verified again before promotion,
+        # so only rebuilds of a serving store need the receipt.
+        if require_receipt and event_count >= FULL_REBUILD_RECEIPT_MIN_EVENTS:
             if readiness_receipt is None:
                 raise ValueError(
                     "full-corpus rebuild requires a current one-use readiness receipt"
@@ -2992,7 +3375,7 @@ def build_search_projections(
             writer = ProjectionBlockWriter(db, projection_handle)
             with forbid_source_transcript_reads() as source_reads:
                 for processed, row in enumerate(
-                    db.execute("SELECT rowid AS event_rowid,* FROM events ORDER BY rowid"), 1,
+                    db.execute(f"SELECT {EVENT_COLUMNS} FROM {EVENT_JOIN} ORDER BY e.event_rowid"), 1,
                 ):
                     value: Any = "[REDACTED]"
                     if row["category"] != "unreadable":
@@ -3017,6 +3400,9 @@ def build_search_projections(
                 new_pack.unlink()
         except FileNotFoundError:
             pass
+        if consumed_receipt is not None:
+            # The build rolled back, so the receipt was not used; it stays valid for a retry.
+            consumed_receipt.unlink(missing_ok=True)
         release_projection_pack_lease(lease)
         raise
     try:
@@ -3024,6 +3410,8 @@ def build_search_projections(
             old_pack.unlink()
     finally:
         release_projection_pack_lease(lease)
+    if consumed_receipt is not None:
+        discard_consumed_receipt_file(readiness_receipt)
     clear_caches()
     return {
         "complete": True, "events": event_count, "snapshot_id": snapshot_id,
@@ -3067,6 +3455,11 @@ def cache_put(cache: OrderedDict[Any, Any], key: Any, value: Any, limit: int = C
 
 
 def clear_caches() -> None:
+    state = _codec_state()
+    state.dictionaries.clear()
+    state.dictionary_codecs.clear()
+    state.blocks.clear()
+    state.block_bytes = 0
     for cache in (
         _SOURCE_CACHE, _STORED_OBJECT_CACHE, _CONTENT_OBJECT_CACHE, _OBJECT_CHILDREN_CACHE,
         _REDACTED_OBJECT_CACHE, _STRUCTURE_BUNDLE_CACHE, _STRUCTURE_META_CACHE, _EVENT_SEARCH_TEXT_CACHE,
@@ -3170,6 +3563,119 @@ def content_from_row(provider: str, value: Any) -> Any | None:
     return None
 
 
+class _DecompressingBlock:
+    """One object block decompressed incrementally: later reads continue where earlier ones stopped."""
+
+    def __init__(self, compressed: bytes, raw_bytes: int) -> None:
+        self.raw_bytes = raw_bytes
+        self.data = bytearray()
+        self._compressed = compressed
+        self._reader = zstd.ZstdDecompressor().stream_reader(compressed)
+
+    def extend_to(self, needed: int, block_key: int) -> None:
+        while len(self.data) < needed and self._reader is not None:
+            try:
+                more = self._reader.read(max(needed - len(self.data), 256 * 1024))
+            except zstd.ZstdError as exc:
+                raise ValueError(f"object block integrity failed: {block_key}") from exc
+            if not more:
+                break
+            self.data += more
+            if len(self.data) > self.raw_bytes:
+                raise ValueError(f"object block integrity failed: {block_key}")
+        if len(self.data) >= self.raw_bytes and self._reader is not None:
+            self._reader.close()
+            self._reader = None
+            self._compressed = b""
+        if len(self.data) < needed:
+            raise ValueError(f"object block integrity failed: {block_key}")
+
+    @property
+    def held_bytes(self) -> int:
+        return len(self.data) + len(self._compressed)
+
+
+def read_object_block(
+    db: sqlite3.Connection, block_key: int, pack_handle: Any | None = None, needed: int | None = None,
+    *, verify: bool = False,
+) -> bytearray:
+    """Decompressed bytes of one solid object block, at least its first `needed` bytes.
+
+    Blocks stay in a small bounded cache with their decompressor open, so reading further into a
+    block continues the decompression instead of repeating it. Serving reads rely on each
+    object's own hash, as single-frame objects do; `verify` (used by full pack verification)
+    also checks the block's compressed-byte hash and, for the whole block, its digest."""
+    state = _codec_state()
+    object_pack = pack_path(db)
+    pack_stat = object_pack.stat()
+    cache_key = (str(object_pack), pack_stat.st_ino, block_key, pack_stat.st_mtime_ns, pack_stat.st_size)
+    entry = None if verify else state.blocks.get(cache_key)
+    if entry is None:
+        block = db.execute(
+            "SELECT pack_offset,compressed_bytes,raw_bytes,compressed_hash,block_digest "
+            "FROM object_blocks WHERE block_key=?", (block_key,),
+        ).fetchone()
+        if not block:
+            raise KeyError(f"object block {block_key}")
+        if block["raw_bytes"] > MAX_OBJECT_BYTES:
+            raise ValueError(f"object block exceeds safety limit: {block_key}")
+        if pack_handle is None:
+            with object_pack.open("rb") as handle:
+                handle.seek(block["pack_offset"])
+                compressed = handle.read(block["compressed_bytes"])
+        else:
+            pack_handle.seek(block["pack_offset"])
+            compressed = pack_handle.read(block["compressed_bytes"])
+        if len(compressed) != block["compressed_bytes"] or (
+            verify and digest_bytes(compressed) != block["compressed_hash"]
+        ):
+            raise ValueError(f"object block integrity failed: {block_key}")
+        entry = _DecompressingBlock(compressed, block["raw_bytes"])
+        if verify:
+            entry.extend_to(block["raw_bytes"], block_key)
+            if digest_bytes(entry.data) != block["block_digest"]:
+                raise ValueError(f"object block integrity failed: {block_key}")
+    else:
+        state.block_bytes -= entry.held_bytes
+    entry.extend_to(entry.raw_bytes if needed is None else min(needed, entry.raw_bytes), block_key)
+    state.blocks[cache_key] = entry
+    state.blocks.move_to_end(cache_key)
+    state.block_bytes += entry.held_bytes
+    while state.block_bytes > OBJECT_BLOCK_CACHE_MAX_BYTES and len(state.blocks) > 1:
+        _key, evicted = state.blocks.popitem(last=False)
+        state.block_bytes -= evicted.held_bytes
+    return entry.data
+
+
+def read_stored_bytes(
+    db: sqlite3.Connection, row: sqlite3.Row | dict[str, Any], pack_handle: Any | None = None,
+) -> bytes:
+    """The verified stored bytes of one object row, whatever its codec."""
+    object_hash = row["object_hash"]
+    if row["stored_bytes"] > MAX_OBJECT_BYTES:
+        raise ValueError(f"stored object exceeds safety limit: {object_hash}")
+    if row["compression"] == COMPRESSION:
+        if pack_handle is None:
+            with pack_path(db).open("rb") as handle:
+                handle.seek(row["pack_offset"])
+                compressed = handle.read(row["compressed_bytes"])
+        else:
+            pack_handle.seek(row["pack_offset"])
+            compressed = pack_handle.read(row["compressed_bytes"])
+        if len(compressed) != row["compressed_bytes"]:
+            raise ValueError(f"stored object extent missing: {object_hash}")
+        data = zstd.decompress(compressed, max_output_size=row["stored_bytes"])
+    elif row["compression"] == BLOCK_COMPRESSION:
+        start = row["block_offset"]
+        block = read_object_block(db, row["block_key"], pack_handle, needed=start + row["stored_bytes"])
+        data = block[start:start + row["stored_bytes"]]
+    else:
+        raise ValueError(f"unsupported object compression: {row['compression']}")
+    if len(data) != row["stored_bytes"] or digest(data) != row["stored_hash"]:
+        raise ValueError(f"stored object length verification failed: {object_hash}")
+    return data
+
+
 def read_stored_object(db: sqlite3.Connection, object_hash: str) -> tuple[sqlite3.Row, Any]:
     object_pack = pack_path(db)
     pack_stat = object_pack.stat()
@@ -3177,21 +3683,12 @@ def read_stored_object(db: sqlite3.Connection, object_hash: str) -> tuple[sqlite
     cached = _STORED_OBJECT_CACHE.get(cache_key)
     if cached is not None:
         return cached
-    row = db.execute("SELECT * FROM objects WHERE object_hash=?", (object_hash,)).fetchone()
+    row = db.execute(
+        f"SELECT {OBJECT_COLUMNS} FROM objects WHERE object_hash=unhex(?)", (object_hash,),
+    ).fetchone()
     if not row:
         raise KeyError(object_hash)
-    if row["compression"] != COMPRESSION:
-        raise ValueError(f"unsupported object compression: {row['compression']}")
-    with object_pack.open("rb") as handle:
-        handle.seek(row["pack_offset"])
-        compressed = handle.read(row["compressed_bytes"])
-    if len(compressed) != row["compressed_bytes"]:
-        raise ValueError(f"stored object extent missing: {object_hash}")
-    if row["stored_bytes"] > MAX_OBJECT_BYTES:
-        raise ValueError(f"stored object exceeds safety limit: {object_hash}")
-    data = zstd.decompress(compressed, max_output_size=row["stored_bytes"])
-    if len(data) != row["stored_bytes"] or digest(data) != row["stored_hash"]:
-        raise ValueError(f"stored object length verification failed: {object_hash}")
+    data = read_stored_bytes(db, row)
     result = (dict(row), json.loads(data))
     cache_put(_STORED_OBJECT_CACHE, cache_key, result)
     return result
@@ -3325,7 +3822,8 @@ def read_event_content(db: sqlite3.Connection, event: sqlite3.Row) -> Any | None
     if not event["content_hash"]:
         return None
     refs = db.execute(
-        "SELECT object_hash FROM event_content WHERE event_id=? ORDER BY ordinal", (event["event_id"],),
+        "SELECT lower(hex(object_hash)) FROM event_content WHERE event_rowid=? ORDER BY ordinal",
+        (event["event_rowid"],),
     ).fetchall()
     values = [read_content_object(db, ref[0]) for ref in refs]
     value = values if event["content_shape"] == "list" else (values[0] if values else None)
@@ -3344,7 +3842,8 @@ def exact_object_closure(db: sqlite3.Connection, roots: Iterable[str]) -> set[st
         visited.add(object_hash)
         frontier.extend(
             row[0] for row in db.execute(
-                "SELECT child_hash FROM object_references WHERE parent_hash=? ORDER BY ordinal",
+                "SELECT lower(hex(child_hash)) FROM object_references WHERE parent_hash=unhex(?) "
+                "ORDER BY ordinal",
                 (object_hash,),
             )
         )
@@ -3371,12 +3870,14 @@ def read_event_structure(db: sqlite3.Connection, event: sqlite3.Row) -> dict[str
     bundle = _STRUCTURE_BUNDLE_CACHE.get(cache_key)
     if bundle is None:
         source = db.execute(
-            "SELECT structure_zstd FROM sources WHERE source_id=? AND source_hash=?",
+            "SELECT structure_zstd,structure_dict_id FROM sources WHERE source_id=? AND source_hash=?",
             (event["source_id"], source_hash),
         ).fetchone()
         if not source:
             raise KeyError(event["source_id"])
-        bundle = zstd.decompress(source["structure_zstd"], max_output_size=structure_raw_bytes)
+        bundle = decompress_structure_bundle(
+            db, source["structure_zstd"], structure_raw_bytes, source["structure_dict_id"],
+        )
         if len(bundle) != structure_raw_bytes:
             raise ValueError(f"structure bundle length verification failed: {event['source_id']}")
         cache_put(_STRUCTURE_BUNDLE_CACHE, cache_key, bundle, 128)
@@ -3410,9 +3911,9 @@ def read_raw_event(db: sqlite3.Connection, event: sqlite3.Row) -> Any:
 
 def reconstruct(db: sqlite3.Connection, provider: str, session_id: str, raw: bool = False) -> list[dict[str, Any]]:
     rows = db.execute(
-        "SELECT e.*,s.path AS source_path FROM events e JOIN sources s USING(source_id) "
+        f"SELECT {EVENT_COLUMNS},src.path AS source_path FROM {EVENT_JOIN} "
         "WHERE e.provider=? AND e.session_id=? "
-        "ORDER BY e.order_timestamp,e.source_id,e.line_number,e.event_id",
+        "ORDER BY e.order_timestamp,src.source_id,e.line_number,e.event_id",
         (provider, session_id),
     ).fetchall()
     result = []
@@ -3489,8 +3990,9 @@ def query_text_near_group(text: str, words: list[str]) -> str | None:
 # unreadable lines get no sessions row (their session is the file stem), so issue-bearing sources
 # stay in scope and the prefilter remains a superset. The event-level clause still decides.
 SESSION_SOURCE_PREFILTER = (
-    "e.source_id IN (SELECT source_id FROM sessions WHERE session_id LIKE ? ESCAPE '\\' "
-    "UNION SELECT source_id FROM sources WHERE issue_count>0)"
+    "e.source_key IN (SELECT sk.source_key FROM sessions ss JOIN sources sk USING(source_id) "
+    "WHERE ss.session_id LIKE ? ESCAPE '\\' "
+    "UNION SELECT source_key FROM sources WHERE issue_count>0)"
 )
 
 
@@ -3533,10 +4035,10 @@ def matching_rows(db: sqlite3.Connection, args: argparse.Namespace) -> tuple[Ite
             )
             values.append(expression)
     sql = (
-        "SELECT e.rowid AS event_rowid,e.*,src.path AS source_path "
-        "FROM events e JOIN sources src USING(source_id) "
+        f"SELECT {EVENT_COLUMNS},src.path AS source_path "
+        f"FROM {EVENT_JOIN} "
         f"WHERE {' AND '.join(clauses)} "
-        "ORDER BY e.order_timestamp,e.provider,e.session_id,e.source_id,e.line_number,e.event_id"
+        "ORDER BY e.order_timestamp,e.provider,e.session_id,src.source_id,e.line_number,e.event_id"
     )
     if args.text:
         return db.execute(sql, tuple(values)), False
@@ -3662,13 +4164,14 @@ def result_window(db: sqlite3.Connection, args: argparse.Namespace) -> tuple[lis
         expanded: dict[str, sqlite3.Row] = {}
         for hit in hits:
             prior = db.execute(
-                "SELECT e.*,src.path AS source_path FROM events e JOIN sources src USING(source_id) "
-                "WHERE e.source_id=? AND e.line_number<? ORDER BY e.line_number DESC LIMIT ?",
+                f"SELECT {EVENT_COLUMNS},src.path AS source_path FROM {EVENT_JOIN} "
+                f"WHERE e.source_key={SOURCE_KEY_OF} AND e.line_number<? "
+                "ORDER BY e.line_number DESC LIMIT ?",
                 (hit["source_id"], hit["line_number"], before),
             ).fetchall() if before else []
             following = db.execute(
-                "SELECT e.*,src.path AS source_path FROM events e JOIN sources src USING(source_id) "
-                "WHERE e.source_id=? AND e.line_number>? ORDER BY e.line_number LIMIT ?",
+                f"SELECT {EVENT_COLUMNS},src.path AS source_path FROM {EVENT_JOIN} "
+                f"WHERE e.source_key={SOURCE_KEY_OF} AND e.line_number>? ORDER BY e.line_number LIMIT ?",
                 (hit["source_id"], hit["line_number"], after),
             ).fetchall() if after else []
             before_clipped |= len(prior) < before
@@ -3703,12 +4206,30 @@ def result_rows(db: sqlite3.Connection, args: argparse.Namespace) -> list[sqlite
     return result_window(db, args)[0]
 
 
+def casefold_find(text: str, needle: str) -> int:
+    """Index in text of needle's first case-insensitive occurrence, or -1.
+
+    Casefolding can lengthen text (ß becomes ss), so an index into text.casefold() is not an
+    index into text; each folded character is mapped back to the character it came from."""
+    folded_needle = needle.casefold()
+    parts: list[str] = []
+    positions: list[int] = []
+    for index, char in enumerate(text):
+        part = char.casefold()
+        parts.append(part)
+        positions.extend([index] * len(part))
+    found = "".join(parts).find(folded_needle)
+    if found < 0:
+        return -1
+    return positions[found] if found < len(positions) else len(text)
+
+
 def matching_snippet(db: sqlite3.Connection, row: sqlite3.Row, text: str, raw: bool) -> str | None:
     if not text:
         return None
     projected = " ".join(event_search_text(db, row, raw).split())
     needle = " ".join(text.split())
-    index = projected.casefold().find(needle.casefold())
+    index = casefold_find(projected, needle)
     if index < 0:
         return None
     start = max(0, index - 60)
@@ -3806,21 +4327,50 @@ def discover_transcript_sources(
                     result.append((provider, root.resolve(), "index"))
                 continue
             for path in root.rglob("*.jsonl"):
-                try:
-                    is_source = path.is_file() and bool(path.stat().st_size)
-                except OSError:
-                    # Active and archived Codex sessions can move between the
-                    # directory walk and the stat. A later discovery round owns
-                    # the new location; the vanished path is not a hard failure.
-                    continue
-                if not is_source:
-                    continue
-                if provider == "claude":
-                    source_class = "subagent" if "subagents" in path.parts else "root"
-                else:
-                    source_class = "archived" if "archived_sessions" in path.parts else "active"
-                result.append((provider, path.resolve(), source_class))
+                entry = _transcript_source(provider, path)
+                if entry is not None:
+                    result.append(entry)
     return sorted(result, key=lambda item: (item[0], str(item[1])))
+
+
+def _transcript_source(provider: str, path: Path) -> tuple[str, Path, str] | None:
+    try:
+        is_source = path.is_file() and bool(path.stat().st_size)
+    except OSError:
+        # Active and archived Codex sessions can move between the
+        # directory walk and the stat. A later discovery round owns
+        # the new location; the vanished path is not a hard failure.
+        return None
+    if not is_source:
+        return None
+    if provider == "claude":
+        source_class = "subagent" if "subagents" in path.parts else "root"
+    else:
+        source_class = "archived" if "archived_sessions" in path.parts else "active"
+    return provider, path.resolve(), source_class
+
+
+def discover_changed_transcript_sources(
+    roots: dict[str, Iterable[str | Path]], paths: Iterable[str | Path],
+) -> list[tuple[str, Path, str]]:
+    """Classify reported file paths exactly as discover_transcript_sources would, without a walk."""
+    result = {}
+    for raw in paths:
+        path = Path(raw)
+        if path.suffix != ".jsonl":
+            continue
+        resolved = path.resolve()
+        for provider, provider_roots in roots.items():
+            for root in provider_roots:
+                root = Path(root).resolve()
+                if resolved == root:
+                    if root.is_file() and root.stat().st_size:
+                        result[resolved] = (provider, resolved, "index")
+                elif root in resolved.parents and not root.is_file():
+                    entry = _transcript_source(provider, resolved)
+                    if entry is not None:
+                        result[resolved] = entry
+    return sorted(result.values(), key=lambda item: (item[0], str(item[1])))
 
 
 def coverage_item_affects_query(item: Any, args: argparse.Namespace) -> bool:
@@ -3850,7 +4400,7 @@ def appended_tail_affects_query(
     else:
         path_name = path.name
     single_session = path_name != CODEX_SESSION_INDEX_NAME and db.execute(
-        "SELECT COUNT(DISTINCT session_id) FROM events WHERE source_id=?", (source_id,),
+        f"SELECT COUNT(DISTINCT session_id) FROM events WHERE source_key={SOURCE_KEY_OF}", (source_id,),
     ).fetchone()[0] <= 1
     for column, requested in (
         ("project", getattr(args, "project", None)),
@@ -3859,13 +4409,16 @@ def appended_tail_affects_query(
     ):
         if single_session and requested and not any(
             _query_filter_matches(value[0], requested)
-            for value in db.execute(f"SELECT DISTINCT {column} FROM events WHERE source_id=?", (source_id,))
+            for value in db.execute(
+                f"SELECT DISTINCT {column} FROM events WHERE source_key={SOURCE_KEY_OF}", (source_id,),
+            )
         ):
             return False
     if getattr(args, "until", None) and path is not None:
         # The record just before the tail dates any untimestamped lines at the tail's start.
         previous = db.execute(
-            "SELECT order_timestamp FROM events WHERE source_id=? ORDER BY line_number DESC LIMIT 1",
+            f"SELECT order_timestamp FROM events WHERE source_key={SOURCE_KEY_OF} "
+            "ORDER BY line_number DESC LIMIT 1",
             (source_id,),
         ).fetchone()
         if region_after_until(path, start, args, previous[0] if previous else None):
@@ -3917,9 +4470,13 @@ def _timestamp_epoch(value: str | None) -> float | None:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
+    # Stored timestamps are UTC; a naive value must not shift with the machine's zone.
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
 
 
 def _indexed_prefix_matches(path: Path, size: int, expected_hash: str) -> bool:
@@ -4238,8 +4795,9 @@ def query_clean(db: sqlite3.Connection, args: argparse.Namespace) -> dict[str, A
         redacted_items = []
         if row["content_hash"]:
             stored_refs = db.execute(
-                "SELECT object_hash FROM event_content WHERE event_id=? ORDER BY ordinal",
-                (row["event_id"],),
+                "SELECT lower(hex(object_hash)) AS object_hash FROM event_content "
+                "WHERE event_rowid=? ORDER BY ordinal",
+                (row["event_rowid"],),
             ).fetchall()
             stored_hashes = [stored_ref["object_hash"] for stored_ref in stored_refs]
             if getattr(args, "include_hashes", False):
@@ -4402,7 +4960,7 @@ def _clean_tail_event(
         needle = " ".join(args.text.split())
         content_text = "\n".join(flatten_text(item) for item in redacted_items)
         if needle.casefold() not in " ".join(content_text.split()).casefold():
-            index = event["search_text"].casefold().find(needle.casefold())
+            index = casefold_find(event["search_text"], needle)
             if index >= 0:
                 compact["match"] = event["search_text"][max(0, index - 60):index + len(needle) + 100]
     return compact
@@ -5635,6 +6193,24 @@ def finish_ranked_order(entries: list[dict[str, Any]], args: argparse.Namespace)
     return diversify_sessions(entries) if getattr(args, "diversify", False) else entries
 
 
+TITLE_CATEGORIES = frozenset({"ai-title", "custom-title", "thread_name"})
+
+
+def promote_title_sessions(entries: list[dict[str, Any]], args: argparse.Namespace) -> list[dict[str, Any]]:
+    """Keep relevance order, moving sessions whose title matched the query before the rest.
+
+    A title names what a session was about, so a title hit outranks sessions that only mention the
+    words in passing (or in bulk tool output). Inside one session there is nothing to reorder."""
+    if getattr(args, "session", None):
+        return entries
+    titled = {(entry["provider"], entry["session"]) for entry in entries
+              if entry["category"] in TITLE_CATEGORIES}
+    if not titled:
+        return entries
+    return ([entry for entry in entries if (entry["provider"], entry["session"]) in titled]
+            + [entry for entry in entries if (entry["provider"], entry["session"]) not in titled])
+
+
 def demote_search_echoes(
     db: sqlite3.Connection, entries: list[dict[str, Any]], text: str,
 ) -> list[dict[str, Any]]:
@@ -5938,7 +6514,7 @@ def bounded_readable_text(value: str, args: argparse.Namespace, remaining: int) 
     if offset is not None and offset < 0:
         raise ValueError("readable offset must be nonnegative")
     if offset is None and query:
-        found = value.casefold().find(str(query).casefold())
+        found = casefold_find(value, str(query))
         start = max(0, found - 256) if found >= 0 else 0
     else:
         start = min(offset or 0, len(value))
@@ -6057,7 +6633,7 @@ def unsupported_events_in_scope(db: sqlite3.Connection, args: argparse.Namespace
     if db.execute("SELECT 1 FROM sources WHERE issue_count>0 LIMIT 1").fetchone() is None:
         return 0, 0
     clauses = [
-        "e.source_id IN (SELECT source_id FROM sources WHERE issue_count>0)",
+        "e.source_key IN (SELECT source_key FROM sources WHERE issue_count>0)",
         "e.supported=0",
     ]
     values: list[Any] = []
@@ -6077,7 +6653,7 @@ def unsupported_events_in_scope(db: sqlite3.Connection, args: argparse.Namespace
         clauses.append("(e.order_timestamp IS NULL OR e.order_timestamp <= ?)")
         values.append(normalize_timestamp(args.until) or args.until)
     row = db.execute(
-        "SELECT COUNT(*),COUNT(DISTINCT e.source_id) FROM events e WHERE " + " AND ".join(clauses),
+        "SELECT COUNT(*),COUNT(DISTINCT e.source_key) FROM events e WHERE " + " AND ".join(clauses),
         values,
     ).fetchone()
     return row[0], row[1]
@@ -6243,11 +6819,11 @@ def _search_index_matches(
         )
         clauses.append("e.rowid IN (SELECT rowid FROM sessiondb_query_hits)")
     sql = (
-        "SELECT e.rowid AS event_rowid,e.*,src.path AS source_path,"
+        f"SELECT {EVENT_COLUMNS},src.path AS source_path,"
         "r.projection_offset,r.projection_bytes,r.projection_hash,"
         "b.block_key,b.block_digest,b.pack_offset,b.compressed_bytes,"
         "b.raw_bytes AS block_raw_bytes,b.compressed_hash "
-        "FROM events e JOIN sources src USING(source_id) "
+        f"FROM {EVENT_JOIN} "
         "JOIN search_projection_refs r ON r.event_rowid=e.rowid "
         "JOIN search_projection_blocks b USING(block_key) "
         f"WHERE {' AND '.join(clauses) if clauses else '1=1'} ORDER BY b.pack_offset,e.rowid"
@@ -6329,9 +6905,9 @@ def _search_index_matches(
         candidate_selection_started = time.monotonic()
         check_query_deadline(args)
         rows = db.execute(
-            "SELECT e.rowid AS event_rowid,e.*,src.path AS source_path,"
+            f"SELECT {EVENT_COLUMNS},src.path AS source_path,"
             "r.projection_bytes,r.projection_hash "
-            "FROM events e JOIN sources src USING(source_id) "
+            f"FROM {EVENT_JOIN} "
             "JOIN search_projection_refs r ON r.event_rowid=e.rowid WHERE "
             + (" AND ".join(clauses) if clauses else "1=1"), tuple(values),
         ).fetchall()
@@ -6372,8 +6948,8 @@ def _search_index_matches(
                 entry["order_timestamp"] or "", entry["provider"],
                 entry["session"], entry["source"]["line"], entry["result_id"],
             ))
-            entries = demote_search_echoes(db, demote_setup_records(
-                demote_repeated_results(entries), getattr(args, "role", None)), text)
+            entries = promote_title_sessions(demote_search_echoes(db, demote_setup_records(
+                demote_repeated_results(entries), getattr(args, "role", None)), text), args)
             entries = finish_ranked_order(entries, args)
         projection_bytes = 0
         block_bytes = 0
@@ -6540,8 +7116,8 @@ def _search_index_matches(
                 digest((entry["provider"] + "\0" + entry["source"]["path"]).encode()),
                 entry["source"]["line"], entry["result_id"],
             ))
-            entries = demote_search_echoes(db, demote_setup_records(
-                demote_repeated_results(entries), getattr(args, "role", None)), text)
+            entries = promote_title_sessions(demote_search_echoes(db, demote_setup_records(
+                demote_repeated_results(entries), getattr(args, "role", None)), text), args)
             entries = finish_ranked_order(entries, args)
         # Build one prefix containing up to the display target of distinct passages;
         # bundle pages hydrate the rest on demand.
@@ -7220,6 +7796,26 @@ def bundle_if_oversized(
 _TITLE_UNTIL: contextvars.ContextVar[str | None] = contextvars.ContextVar("title_until", default=None)
 
 
+def _is_provider_title(provider: str | None, category: str | None) -> bool:
+    if provider == "claude":
+        return category in {"ai-title", "custom-title"}
+    return provider == "codex" and category == "thread_name"
+
+
+def title_record_text(db: sqlite3.Connection, row: sqlite3.Row) -> str | None:
+    """The title a title record holds. Titles live in the record's structure, not its content:
+    Claude title records have no content at all."""
+    if not _is_provider_title(row["provider"], row["category"]):
+        return None
+    structure = read_event_structure(db, row)
+    if row["provider"] == "claude":
+        field = "customTitle" if row["category"] == "custom-title" else "aiTitle"
+        title = structure.get(field) or structure.get("title")
+    else:
+        title = structure.get("thread_name")
+    return title if isinstance(title, str) else None
+
+
 def visible_session_titles(
     db_path: Path, sessions: dict[str, Any], until: str | None = None,
 ) -> dict[str, Any]:
@@ -7259,9 +7855,9 @@ def visible_session_titles(
                 continue
             try:
                 rows = db.execute(
-                    "SELECT e.*,src.path AS source_path FROM sessions s "
-                    "JOIN events e ON e.source_id=s.source_id AND e.session_id=s.session_id "
-                    "JOIN sources src ON src.source_id=e.source_id "
+                    f"SELECT {EVENT_COLUMNS},src.path AS source_path FROM sessions s "
+                    "JOIN sources src ON src.source_id=s.source_id "
+                    "JOIN events e ON e.source_key=src.source_key AND e.session_id=s.session_id "
                     # Matches events_title_idx exactly, so only title records are read.
                     "WHERE s.provider=? AND s.session_id=? AND e.category IN "
                     "('ai-title','custom-title','thread_name') "
@@ -7285,20 +7881,13 @@ def visible_session_titles(
                     if time.monotonic() >= deadline:
                         value["title"]["reason"] = "title_time_budget_exceeded"
                         break
-                    if provider == "claude" and row["category"] not in {"ai-title", "custom-title"}:
-                        continue
-                    if provider == "codex" and row["category"] != "thread_name":
+                    if not _is_provider_title(provider, row["category"]):
                         continue
                     inspected_bytes += row["structure_bytes"] or 0
                     if inspected_bytes > byte_limit:
                         value["title"]["reason"] = "title_byte_budget_exceeded"
                         break
-                    structure = read_event_structure(db, row)
-                    if provider == "claude":
-                        field = "customTitle" if row["category"] == "custom-title" else "aiTitle"
-                        title = structure.get(field) or structure.get("title")
-                    else:
-                        title = structure.get("thread_name")
+                    title = title_record_text(db, row)
                     if time.monotonic() >= deadline:
                         value["title"]["reason"] = "title_time_budget_exceeded"
                         break
@@ -7469,7 +8058,7 @@ def hydrate_bundle_passages(
                     continue
                 event_id, source_id, line_number = parse_retrieval_result_id(entry["result_id"])
                 row = db.execute(
-                    "SELECT * FROM events WHERE event_id=?", (event_id,),
+                    f"SELECT {EVENT_COLUMNS} FROM {EVENT_JOIN} WHERE e.event_id=unhex(?)", (event_id,),
                 ).fetchone()
                 if not row or (
                     source_id is not None
@@ -7581,7 +8170,7 @@ def detail_events(db: sqlite3.Connection, args: argparse.Namespace) -> dict[str,
     for result_id in requested:
         event_id, expected_source_id, expected_line = parse_retrieval_result_id(result_id)
         row = db.execute(
-            "SELECT e.*,src.path AS source_path FROM events e JOIN sources src USING(source_id) WHERE e.event_id=?",
+            f"SELECT {EVENT_COLUMNS},src.path AS source_path FROM {EVENT_JOIN} WHERE e.event_id=unhex(?)",
             (event_id,),
         ).fetchone()
         if row and (
@@ -7595,13 +8184,14 @@ def detail_events(db: sqlite3.Connection, args: argparse.Namespace) -> dict[str,
     contexts: dict[str, dict[str, Any]] = {}
     for result_id, hit in selected.items():
         prior = db.execute(
-            "SELECT e.*,src.path AS source_path FROM events e JOIN sources src USING(source_id) "
-            "WHERE e.source_id=? AND e.line_number<? ORDER BY e.line_number DESC LIMIT ?",
+            f"SELECT {EVENT_COLUMNS},src.path AS source_path FROM {EVENT_JOIN} "
+            f"WHERE e.source_key={SOURCE_KEY_OF} AND e.line_number<? "
+            "ORDER BY e.line_number DESC LIMIT ?",
             (hit["source_id"], hit["line_number"], before),
         ).fetchall() if before else []
         following = db.execute(
-            "SELECT e.*,src.path AS source_path FROM events e JOIN sources src USING(source_id) "
-            "WHERE e.source_id=? AND e.line_number>? ORDER BY e.line_number LIMIT ?",
+            f"SELECT {EVENT_COLUMNS},src.path AS source_path FROM {EVENT_JOIN} "
+            f"WHERE e.source_key={SOURCE_KEY_OF} AND e.line_number>? ORDER BY e.line_number LIMIT ?",
             (hit["source_id"], hit["line_number"], after),
         ).fetchall() if after else []
         ordered = [*reversed(prior), hit, *following]
@@ -8001,7 +8591,7 @@ def iter_live_tail_events(
     meta = dict(state or {})
     auto_extensions = load_auto_metadata_extensions(db, provider)
     last_exact = db.execute(
-        "SELECT MAX(order_timestamp) FROM events WHERE source_id=?", (source_id,),
+        f"SELECT MAX(order_timestamp) FROM events WHERE source_key={SOURCE_KEY_OF}", (source_id,),
     ).fetchone()[0] if offset else None
     line_number = data[:offset].count(b"\n")
     for raw_line in io.BytesIO(data[offset:end]):
@@ -8707,29 +9297,70 @@ def verify_projection_pack(db: sqlite3.Connection) -> dict[str, Any]:
 
 
 def verify_pack(db: sqlite3.Connection) -> dict[str, Any]:
+    """Verify every object pack extent (single frames and solid blocks) and every object in it."""
     path = pack_path(db)
     pack_bytes = path.stat().st_size if path.exists() else 0
     cursor = 0
     gaps = []
     failures = []
     checked = 0
-    for row in db.execute("SELECT * FROM objects ORDER BY pack_offset,object_hash"):
-        start = row["pack_offset"]
-        end = start + row["compressed_bytes"]
-        if start < cursor:
-            failures.append({"hash": row["object_hash"], "error": "overlapping pack extent"})
-            continue
-        if start > cursor:
-            gaps.append({"offset": cursor, "bytes": start - cursor})
-        if end > pack_bytes:
-            failures.append({"hash": row["object_hash"], "error": "pack extent beyond file"})
-        else:
+    extents = db.execute(
+        "SELECT pack_offset,compressed_bytes,lower(hex(object_hash)) AS name,NULL AS block_key "
+        "FROM objects WHERE block_key IS NULL "
+        "UNION ALL SELECT pack_offset,compressed_bytes,NULL,block_key FROM object_blocks "
+        "ORDER BY 1,3,4"
+    ).fetchall()
+    members: dict[int, list[sqlite3.Row]] = {}
+    for row in db.execute(
+        f"SELECT {OBJECT_COLUMNS} FROM objects WHERE block_key IS NOT NULL ORDER BY block_key,block_offset"
+    ):
+        members.setdefault(row["block_key"], []).append(row)
+    unknown_blocks = set(members) - {row["block_key"] for row in extents if row["block_key"] is not None}
+    for block_key in sorted(unknown_blocks):
+        for row in members[block_key]:
+            failures.append({"hash": row["object_hash"], "error": "object block missing"})
+    with (path.open("rb") if path.exists() else open(os.devnull, "rb")) as handle:
+        for extent in extents:
+            label = extent["name"] or f"block:{extent['block_key']}"
+            if extent["pack_offset"] is None or extent["compressed_bytes"] is None:
+                failures.append({"hash": label, "error": "missing pack extent"})
+                continue
+            start = extent["pack_offset"]
+            end = start + extent["compressed_bytes"]
+            if start < cursor:
+                failures.append({"hash": label, "error": "overlapping pack extent"})
+                continue
+            if start > cursor:
+                gaps.append({"offset": cursor, "bytes": start - cursor})
+            cursor = max(cursor, end)
+            if end > pack_bytes:
+                failures.append({"hash": label, "error": "pack extent beyond file"})
+                continue
+            if extent["block_key"] is None:
+                try:
+                    read_stored_object(db, extent["name"])
+                    checked += 1
+                except Exception as exc:
+                    failures.append({"hash": label, "error": str(exc)})
+                continue
             try:
-                read_stored_object(db, row["object_hash"])
-                checked += 1
+                block = read_object_block(db, extent["block_key"], handle, verify=True)
             except Exception as exc:
-                failures.append({"hash": row["object_hash"], "error": str(exc)})
-        cursor = max(cursor, end)
+                failures.append({"hash": label, "error": str(exc)})
+                for row in members.get(extent["block_key"], []):
+                    failures.append({"hash": row["object_hash"], "error": "object block unreadable"})
+                continue
+            covered = 0
+            for row in members.get(extent["block_key"], []):
+                if row["block_offset"] < covered or row["block_offset"] + row["stored_bytes"] > len(block):
+                    failures.append({"hash": row["object_hash"], "error": "object block layout mismatch"})
+                    continue
+                covered = row["block_offset"] + row["stored_bytes"]
+                try:
+                    json.loads(read_stored_bytes(db, row, handle))
+                    checked += 1
+                except Exception as exc:
+                    failures.append({"hash": row["object_hash"], "error": str(exc)})
     if cursor < pack_bytes:
         gaps.append({"offset": cursor, "bytes": pack_bytes - cursor})
     return {
@@ -8836,9 +9467,8 @@ def write_record_stream(db: sqlite3.Connection, path: Path, args: argparse.Names
         "unreadable_records": coverage_row["unreadable"] or 0,
     }
     sql = (
-        "SELECT e.rowid AS event_rowid,e.*,src.path AS source_path FROM events e "
-        "JOIN sources src USING(source_id) WHERE "
-        + scope + " ORDER BY e.rowid"
+        f"SELECT {EVENT_COLUMNS},src.path AS source_path FROM {EVENT_JOIN} WHERE "
+        + scope + " ORDER BY e.event_rowid"
     )
     descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     count = 0
@@ -8912,7 +9542,6 @@ def write_record_stream(db: sqlite3.Connection, path: Path, args: argparse.Names
             "source_reads": source_reads["attempts"]}
 
 
-# ---------------------------------------------------------------- agent reading (text output)
 # Agents read conversations, not provider envelopes: one text line per message, tool calls and
 # results collapsed to one line each. Nothing is deleted: harness-injected blocks, setup records,
 # and full tool output stay reachable (`--show-hidden`, or one record with `--line L --full`).
@@ -9102,12 +9731,13 @@ def _session_rows(db: sqlite3.Connection, provider: str, session: str,
                   args: argparse.Namespace) -> list[sqlite3.Row]:
     """Every record of the session in one deterministic order, within the time filters."""
     # The session's sources come from the sessions table, so the event lookup uses the
-    # (source_id, line_number) index instead of scanning every event.
+    # (source_key, line_number) index instead of scanning every event.
     sources = [row[0] for row in db.execute(
-        "SELECT source_id FROM sessions WHERE provider=? AND session_id=?", (provider, session))]
+        "SELECT src.source_key FROM sessions s JOIN sources src USING(source_id) "
+        "WHERE s.provider=? AND s.session_id=?", (provider, session))]
     if not sources:
         return []
-    clauses = [f"e.source_id IN ({','.join('?' * len(sources))})", "e.provider=?", "e.session_id=?"]
+    clauses = [f"e.source_key IN ({','.join('?' * len(sources))})", "e.provider=?", "e.session_id=?"]
     values: list[Any] = [*sources, provider, session]
     if getattr(args, "since", None):
         clauses.append("e.order_timestamp >= ?")
@@ -9116,8 +9746,8 @@ def _session_rows(db: sqlite3.Connection, provider: str, session: str,
         clauses.append("e.order_timestamp <= ?")
         values.append(normalize_timestamp(args.until) or args.until)
     return db.execute(
-        "SELECT e.*,s.path AS source_path FROM events e JOIN sources s USING(source_id) WHERE "
-        + " AND ".join(clauses) + " ORDER BY e.order_timestamp,e.source_id,e.line_number,e.event_id",
+        f"SELECT {EVENT_COLUMNS},src.path AS source_path FROM {EVENT_JOIN} WHERE "
+        + " AND ".join(clauses) + " ORDER BY e.order_timestamp,src.source_id,e.line_number,e.event_id",
         values,
     ).fetchall()
 
@@ -9561,6 +10191,9 @@ def render_search_text(result: dict[str, Any], db_path: Path | None = None,
     if str(result.get("reason") or "").startswith("query_error:"):
         return (f"query error: {result['reason'][len('query_error:'):].strip()} — fix the query and search "
                 "again; this is not a coverage gap")
+    if str(result.get("reason") or "").startswith("database_error:") and not entries:
+        return (f"search could not read the database ({result['reason'][len('database_error:'):].strip()}) "
+                "— this is not a no-match; run the same search again in a minute")
     if result.get("complete") is False:
         head += f" (coverage incomplete: {result.get('reason') or 'see affected sources'})"
     if result.get("widened_from"):
@@ -9700,7 +10333,6 @@ def drop_after_until(result: dict[str, Any], args: argparse.Namespace, key: str)
     return result
 
 
-# ---------------------------------------------------------------- grep over the stored history
 # What agents otherwise do with grep, rg, or Python on transcript files: find every record whose
 # text matches a fixed string or a regular expression, with the text around each match. Words in
 # the pattern pick candidates through the search index; the pattern itself decides every match.
@@ -9818,8 +10450,7 @@ def grep_history(db_path: Path, args: argparse.Namespace) -> str:
         if rowids is None and not scoped:
             return ("pattern error: the pattern has no word to look up (at least two letters or digits "
                     "outside regex syntax); add a word, or limit the scan with --session or --since/--until")
-        select = ("SELECT e.rowid AS event_rowid,e.*,s.path AS source_path FROM events e "
-                  "JOIN sources s USING(source_id) WHERE ")
+        select = f"SELECT {EVENT_COLUMNS},src.path AS source_path FROM {EVENT_JOIN} WHERE "
         rows: list[sqlite3.Row] = []
         if rowids is None:
             rows = db.execute(select + (" AND ".join(clauses) or "1=1") + f" LIMIT {GREP_SCAN_LIMIT + 1}",
@@ -9953,10 +10584,11 @@ def list_sessions(db_path: Path, args: argparse.Namespace) -> str:
             for start in range(0, len(rowids), 900):
                 chunk = rowids[start:start + 900]
                 for row in db.execute(
-                        "SELECT e.* FROM events e WHERE e.rowid IN (" + ",".join("?" * len(chunk)) + ") "
+                        f"SELECT {EVENT_COLUMNS} FROM {EVENT_JOIN} WHERE e.rowid IN ("
+                        + ",".join("?" * len(chunk)) + ") "
                         "AND e.category IN ('ai-title','custom-title','thread_name') ORDER BY e.order_timestamp",
                         chunk):
-                    title = " ".join(_plain_text(read_event_content(db, row)).split())
+                    title = " ".join((title_record_text(db, row) or "").split())
                     folded = _accent_fold(title)
                     if all(re.search(r"(?<![^\W_])" + re.escape(word), folded) for word in wanted):
                         titled[(row["provider"], row["session_id"])] = title
@@ -9966,8 +10598,9 @@ def list_sessions(db_path: Path, args: argparse.Namespace) -> str:
         if titled is not None:
             # Through the sessions' own sources, so the source index is used instead of a full scan.
             sources = [row[0] for key in titled for row in db.execute(
-                "SELECT source_id FROM sessions WHERE provider=? AND session_id=?", key)]
-            clauses.append("e.source_id IN (" + ",".join("?" * len(sources)) + ")")
+                "SELECT src.source_key FROM sessions s JOIN sources src USING(source_id) "
+                "WHERE s.provider=? AND s.session_id=?", key)]
+            clauses.append("e.source_key IN (" + ",".join("?" * len(sources)) + ")")
             values.extend(sources)
             clauses.append("(e.provider,e.session_id) IN (VALUES " + ",".join("(?,?)" for _ in titled) + ")")
             values.extend(item for key in titled for item in key)
@@ -10125,6 +10758,22 @@ def main(argv: list[str] | None = None) -> int:
     p_sessions.add_argument("--project")
     p_sessions.add_argument("--reverse", action="store_true", help="newest first")
     p_sessions.add_argument("--limit", type=_positive_int, default=SESSIONS_LISTED)
+    p_tokens = commands.add_parser(
+        "token-usage", help="context size per model call and the heaviest sessions in a window (JSON)")
+    p_tokens.add_argument("--since", type=_since_bound, required=True)
+    p_tokens.add_argument("--until", type=_until_bound)
+    p_tokens.add_argument("--limit", type=_positive_int, default=10)
+    p_launch = commands.add_parser(
+        "record-launch", help="record a delegated child's parent (for a launcher; JSON result)")
+    p_launch.add_argument("--child", required=True)
+    p_launch.add_argument("--parent", required=True)
+    p_launch.add_argument("--root", help="the parent's root run; defaults to the parent")
+    p_launch.add_argument("--launched-at", required=True)
+    p_launch.add_argument("--launcher", required=True)
+    p_launch.add_argument("--model")
+    p_launch.add_argument("--reasoning-effort")
+    p_launch.add_argument("--context-mode")
+    p_launch.add_argument("--purpose")
     p_bundle = commands.add_parser("bundle-page")
     p_bundle.add_argument("--bundle", type=Path, required=True)
     p_bundle.add_argument("--case-id")
@@ -10212,6 +10861,35 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "sessions":
         _print_text(list_sessions(args.db, args))
+        return 0
+    if args.command == "record-launch":
+        db = connect(args.db)
+        try:
+            with db:
+                result = token_usage.record_launch(
+                    db, args.child, args.parent, args.root, args.launched_at, args.launcher,
+                    args.model, args.reasoning_effort, args.context_mode, args.purpose)
+        except ValueError as exc:
+            json_print({"recorded": False, "child_run_id": args.child, "error": str(exc)})
+            return 1
+        finally:
+            db.close()
+        json_print(result)
+        return 0
+    if args.command == "token-usage":
+        db = connect(args.db, read_only=True)
+        try:
+            summary = token_usage.usage_summary(db, args.since, args.until, args.limit)
+            summary["projection"] = token_usage.status(db)
+        finally:
+            db.close()
+        heaviest = summary["heaviest_sessions"]
+        titles = visible_session_titles(args.db, {
+            f"s{n}": {"provider": "claude" if row["provider"] == "anthropic" else row["provider"],
+                      "session": row["session_id"]} for n, row in enumerate(heaviest)})
+        for n, row in enumerate(heaviest):
+            row["title"] = (titles[f"s{n}"].get("title") or {}).get("value")
+        json_print(summary)
         return 0
     if args.command == "grep":
         _print_text(grep_history(args.db, args))

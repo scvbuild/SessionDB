@@ -35,8 +35,6 @@ class SearchNoiseAndTitlesTest(unittest.TestCase):
         return sessiondb.bundle_if_oversized(
             self.db_path, sessiondb.search_index(self.db, _search_args(**overrides)), None)
 
-    # ---------------------------------------------------------------- role filter
-
     def test_user_role_filter_skips_tool_results_stored_as_user_records(self):
         self.ingest("claude", [
             {"type": "assistant", "sessionId": "c1", "message": {"role": "assistant", "content": [
@@ -55,8 +53,6 @@ class SearchNoiseAndTitlesTest(unittest.TestCase):
             provider=None, session="c1", role="user", tool=None, lineage=None, project=None,
             since=None, until=None, text=None, raw=False, limit=10, offset=0))
         self.assertEqual([row["tool_event"] for row in rows], [0])
-
-    # ---------------------------------------------------------------- setup records
 
     def test_system_prompts_rank_after_conversation_unless_asked_for(self):
         prompt_rows = [
@@ -89,8 +85,6 @@ class SearchNoiseAndTitlesTest(unittest.TestCase):
         order = [entry["n"] for entry in sessiondb.demote_setup_records(entries, None)]
         self.assertEqual(order, [2, 4, 1, 3])
         self.assertEqual([e["n"] for e in sessiondb.demote_setup_records(entries, "developer")], [1, 2, 3, 4])
-
-    # ---------------------------------------------------------------- Codex titles
 
     def test_codex_session_index_rows_become_searchable_titles(self):
         self.ingest("codex", [
@@ -127,7 +121,8 @@ class SearchNoiseAndTitlesTest(unittest.TestCase):
         title = found["sessions"][found["entries"][0]["session"]]["title"]
         self.assertEqual(title, {"status": "known", "value": "Title 299"})
         plan = " ".join(row[3] for row in self.db.execute(
-            "EXPLAIN QUERY PLAN SELECT e.* FROM sessions s JOIN events e ON e.source_id=s.source_id "
+            "EXPLAIN QUERY PLAN SELECT e.* FROM sessions s JOIN sources src ON src.source_id=s.source_id "
+            "JOIN events e ON e.source_key=src.source_key "
             "AND e.session_id=s.session_id WHERE s.provider='claude' AND s.session_id='many-c' "
             "AND e.category IN ('ai-title','custom-title','thread_name') "
             "ORDER BY e.order_timestamp DESC, e.line_number DESC LIMIT 8"))

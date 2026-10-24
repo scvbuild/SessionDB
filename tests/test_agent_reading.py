@@ -541,12 +541,34 @@ class SessionsListTest(_ReadingFixture):
         none = sessiondb.list_sessions(self.db_path, argparse.Namespace(**{**args, "title": "invoice"}))
         self.assertEqual(none, "0 sessions")
 
+    def test_claude_sessions_are_found_by_title(self):
+        # Claude title records keep the title in a field, not in message content.
+        self.ingest("claude", [
+            {"type": "user", "sessionId": "lead-c", "timestamp": "2026-09-03T05:31:05Z",
+             "message": {"role": "user", "content": "check the clinic proposal"}},
+            {"type": "custom-title", "sessionId": "lead-c", "customTitle": "Sakura lead: Line OA integration"},
+            {"type": "agent-name", "sessionId": "lead-c", "agentName": "Sakura lead: Line OA integration"},
+        ], "lead-c.jsonl")
+        self.ingest("claude", [
+            {"type": "user", "sessionId": "meme-c", "timestamp": "2026-09-03T06:00:00Z",
+             "message": {"role": "user", "content": "make a meme"}},
+            {"type": "ai-title", "sessionId": "meme-c", "aiTitle": "Karpathy frontier models meme"},
+        ], "meme-c.jsonl")
+        self.db.commit()
+        args = dict(since=None, until=None, provider=None, project=None, reverse=False, limit=60)
+        for title, session in (("Sakura Line OA", "lead-c"), ("karpathy meme", "meme-c")):
+            listed = sessiondb.list_sessions(self.db_path, argparse.Namespace(**args, title=title))
+            self.assertTrue(listed.startswith("1 sessions"), listed)
+            self.assertIn(f"claude {session} ·", listed)
+        self.assertEqual(sessiondb.list_sessions(self.db_path, argparse.Namespace(**args, title="clinic")),
+                         "0 sessions")
 
-class AgentGuideCoverageTest(unittest.TestCase):
-    def test_the_agent_guide_names_every_agent_command(self):
-        guide = Path(__file__).resolve().parents[3] / "global-config" / "all" / "sessiondb-retrieval.md"
-        if not guide.exists():
-            self.skipTest("the agent retrieval guide lives in the private repository")
-        text = guide.read_text(encoding="utf-8")
-        missing = [name for name in sessiondb.AGENT_COMMANDS if f"`{name}" not in text]
-        self.assertEqual(missing, [], "add these commands to global-config/all/sessiondb-retrieval.md")
+
+class SearchTextErrorTest(unittest.TestCase):
+    def test_an_unreadable_database_is_not_reported_as_a_no_match(self):
+        result = {"complete": False, "entries": [], "total": None, "sessions": {}, "sources": {},
+                  "reason": "database_error: database is locked"}
+        text = sessiondb.render_search_text(result)
+        self.assertIn("could not read the database (database is locked)", text)
+        self.assertIn("not a no-match", text)
+        self.assertNotIn("try other words", text)
